@@ -26,7 +26,7 @@ anyhow = "1.0.75"
 libc = "0.2.149"
 
 # Demikernel Organization
-demikernel = { git = "https://github.com/esaurez/demikernel", branch = "feature-pal-vm_shared_memory"}
+demikernel = { git = "https://github.com/esaurez/demikernel", branch = "feature-pal-virtio_shared_memory"}
 
 #=======================================================================================================================
 # Features
@@ -34,7 +34,7 @@ demikernel = { git = "https://github.com/esaurez/demikernel", branch = "feature-
 
 [features]
 default = [ "catnap-libos" ]
-catnap-libos = [ "demikernel/catnap-libos", "demikernel/catloop-libos" ]
+catnap-libos = [ "demikernel/catnap-libos", "demikernel/catloop-libos", "demikernel/virtio-shmem" ]
 
 #=======================================================================================================================
 # Profile
