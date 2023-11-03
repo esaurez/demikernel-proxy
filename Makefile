@@ -8,6 +8,10 @@
 export DEMIKERNEL_HOME ?= $(HOME)
 export CONFIG_PATH ?= $(DEMIKERNEL_HOME)/config.yaml
 
+export PREFIX ?= $(HOME)
+export PKG_CONFIG_PATH ?= $(shell find $(PREFIX)/lib/ -name '*pkgconfig*' -type d 2> /dev/null | xargs | sed -e 's/\s/:/g')
+export LD_LIBRARY_PATH ?= $(HOME)/lib:$(shell find $(PREFIX)/lib/ -name '*x86_64-linux-gnu*' -type d 2> /dev/null | xargs | sed -e 's/\s/:/g')
+
 #=======================================================================================================================
 # Build Configuration
 #=======================================================================================================================
@@ -43,6 +47,18 @@ export CARGO_FLAGS += --profile $(BUILD)
 export LIBOS ?= catnap
 export CARGO_FEATURES := --features=$(LIBOS)-libos
 
+ifeq ($(LIBOS),catnip)
+DRIVER ?= $(shell [ ! -z "`lspci | grep -E "ConnectX-[4,5,6]"`" ] && echo mlx5 || echo mlx4)
+CARGO_FEATURES += --features=demikernel/$(DRIVER)
+endif
+
+# Enable VM Shared Memory
+export VM_SHM ?= no
+ifeq ($(VM_SHM),yes)
+CARGO_FEATURES += --features=demikernel/virtio-shmem
+CARGO_FEATURES += --features=virtio-shmem
+endif
+
 #=======================================================================================================================
 # Run Parameters
 #=======================================================================================================================
@@ -56,6 +72,8 @@ export ARGS := $(LISTEN_ADDR):$(LISTEN_PORT) $(CONNECT_ADDR):$(CONNECT_PORT)
 #=======================================================================================================================
 
 all:
+	@echo "LD_LIBRARY_PATH: $(LD_LIBRARY_PATH)"
+	@echo "PKG_CONFIG_PATH: $(PKG_CONFIG_PATH)"
 	@echo "$(CARGO) build $(CARGO_FEATURES) $(CARGO_FLAGS)"
 	$(CARGO) build $(CARGO_FEATURES) $(CARGO_FLAGS)
 
