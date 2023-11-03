@@ -10,6 +10,8 @@
 //======================================================================================================================
 
 use ::anyhow::Result;
+#[cfg(feature = "virtio-shmem")]
+use ::demikernel::pal::linux::virtio_shmem::SharedMemory;
 use ::demikernel::{
     demi_sgarray_t,
     runtime::types::{
@@ -39,7 +41,7 @@ use ::std::{
 
 struct TcpProxy {
     /// LibOS that handles incoming flow.
-    catnap: LibOS,
+    in_libos: LibOS,
     /// LibOS that handles outgoing flow.
     catloop: LibOS,
     /// Number of clients that are currently connected.
@@ -85,7 +87,7 @@ impl TcpProxy {
         };
 
         // Instantiate LibOS for handling incoming flows.
-        let mut catnap: LibOS = match LibOS::new(libos_name) {
+        let mut in_libos: LibOS = match LibOS::new(libos_name) {
             Ok(libos) => libos,
             Err(e) => anyhow::bail!("failed to initialize libos (error={:?})", e),
         };
@@ -97,10 +99,10 @@ impl TcpProxy {
         };
 
         // Setup local socket.
-        let local_socket: QDesc = Self::setup_local_socket(&mut catnap, local_addr)?;
+        let local_socket: QDesc = Self::setup_local_socket(&mut in_libos, local_addr)?;
 
         Ok(Self {
-            catnap,
+            in_libos,
             catloop,
             nclients: 0,
             remote_addr,
@@ -128,6 +130,10 @@ impl TcpProxy {
         // Timeout for polling outgoing operations. This was intentionally set to zero to force no waiting.
         let timeout_outgoing: Option<Duration> = Some(Duration::from_secs(0));
 
+        // Initialize the shared memory for catloop
+        #[cfg(feature = "virtio-shmem")]
+        SharedMemory::initialize_static_mem_manager();
+
         // Accept incoming connections.
         self.issue_accept()?;
 
@@ -153,14 +159,14 @@ impl TcpProxy {
                             anyhow::bail!("operation failed")
                         }
                         println!("WARN: client reset connection");
-                        let catnap_qd: QDesc = qr.qr_qd.into();
+                        let in_libos_qd: QDesc = qr.qr_qd.into();
                         // It is safe to expect here because the queue descriptor must have been registered.
                         // All queue descriptors are registered when the connection is established.
                         let catloop_qd: QDesc = *self
                             .outgoing_qds_map
-                            .get(&catnap_qd)
+                            .get(&in_libos_qd)
                             .expect("queue descriptor not registered");
-                        self.close_client(catnap_qd, catloop_qd);
+                        self.close_client(in_libos_qd, catloop_qd);
                     },
                     _ => unreachable!(),
                 };
@@ -182,11 +188,11 @@ impl TcpProxy {
                         let catloop_socket: QDesc = qr.qr_qd.into();
                         // It is safe to expect() here because the queue descriptor must have been registered.
                         // All queue descriptors are registered when the connection is established.
-                        let catnap_socket: QDesc = *self
+                        let in_libos_socket: QDesc = *self
                             .incoming_qds_map
                             .get(&catloop_socket)
                             .expect("queue descriptor not registered");
-                        self.close_client(catnap_socket, catloop_socket);
+                        self.close_client(in_libos_socket, catloop_socket);
                     },
                     _ => unreachable!(),
                 };
@@ -217,7 +223,7 @@ impl TcpProxy {
     /// Issues an `accept()`operation.
     /// This function fails if the underlying `accept()` operation fails.
     fn issue_accept(&mut self) -> Result<()> {
-        let qt: QToken = self.catnap.accept(self.local_socket)?;
+        let qt: QToken = self.in_libos.accept(self.local_socket)?;
         self.register_incoming_operation(self.local_socket, qt)?;
         Ok(())
     }
@@ -225,7 +231,7 @@ impl TcpProxy {
     /// Issues a `push()` operation in an incoming flow.
     /// This function fails if the underlying `push()` operation fails.
     fn issue_incoming_push(&mut self, qd: QDesc, sga: &demi_sgarray_t) -> Result<()> {
-        let qt: QToken = self.catnap.push(qd, &sga)?;
+        let qt: QToken = self.in_libos.push(qd, &sga)?;
 
         // It is safe to call except() here, because we just issued the `push()` operation,
         // queue tokens are unique, and thus the operation is ensured to not be registered.
@@ -238,7 +244,7 @@ impl TcpProxy {
     /// Issues a `pop()` operation in an incoming flow.
     /// This function fails if the underlying `pop()` operation fails.
     fn issue_incoming_pop(&mut self, qd: QDesc) -> Result<()> {
-        let qt: QToken = self.catnap.pop(qd, None)?;
+        let qt: QToken = self.in_libos.pop(qd, None)?;
 
         // It is safe to call except() here, because we just issued the `pop()` operation,
         // queue tokens are unique, and thus the operation is ensured to not be registered.
@@ -248,11 +254,11 @@ impl TcpProxy {
         // Set the flag to indicate that this flow has an inflight `pop()` operation.
         // It is safe to call except() here, because `qd` is ensured to be in the table of queue descriptors.
         // All queue descriptors are registered when connection is established.
-        let catnap_inflight_pop: &mut bool = self
+        let in_libos_inflight_pop: &mut bool = self
             .incoming_qds
             .get_mut(&qd)
             .expect("queue descriptor should be registered");
-        *catnap_inflight_pop = true;
+        *in_libos_inflight_pop = true;
 
         Ok(())
     }
@@ -338,13 +344,13 @@ impl TcpProxy {
 
         // It is safe to call except() here, because `catloop_qd` is ensured to be in the table of queue descriptors.
         // All queue descriptors are registered when connection is established.
-        let catnap_qd: QDesc = *self
+        let in_libos_qd: QDesc = *self
             .incoming_qds_map
             .get(&catloop_qd)
             .expect("queue descriptor should be registered");
 
         // Issue a `pop()` operation in the outgoing flow.
-        if let Err(e) = self.issue_incoming_pop(catnap_qd) {
+        if let Err(e) = self.issue_incoming_pop(in_libos_qd) {
             // Failed to issue pop operation, log error.
             println!("ERROR: pop failed (error={:?})", e);
         }
@@ -356,19 +362,19 @@ impl TcpProxy {
     /// Handles the completion of a `pop()` operation on an incoming flow.
     fn handle_incoming_pop(&mut self, qr: &demi_qresult_t) {
         let incoming_sga: demi_sgarray_t = unsafe { qr.qr_value.sga };
-        let catnap_qd: QDesc = qr.qr_qd.into();
+        let in_libos_qd: QDesc = qr.qr_qd.into();
 
-        // It is safe to call except() here, because `catnap_qd` is ensured to be in the table of queue descriptors.
+        // It is safe to call except() here, because `in_libos_qd` is ensured to be in the table of queue descriptors.
         // All queue descriptors are registered when connection is established.
         let catloop_qd: QDesc = *self
             .outgoing_qds_map
-            .get(&catnap_qd)
+            .get(&in_libos_qd)
             .expect("queue descriptor should be registered");
 
         // Check if client closed connection.
         if incoming_sga.sga_segs[0].sgaseg_len == 0 {
             println!("INFO: client closed connection");
-            self.close_client(catnap_qd, catloop_qd);
+            self.close_client(in_libos_qd, catloop_qd);
             return;
         }
 
@@ -395,14 +401,14 @@ impl TcpProxy {
         }
 
         // Release incoming SGA.
-        if let Err(e) = self.catnap.sgafree(incoming_sga) {
+        if let Err(e) = self.in_libos.sgafree(incoming_sga) {
             // Failed to release SGA, log error.
             println!("ERROR: sgafree failed (error={:?})", e);
             println!("WARN: leaking incoming sga");
         }
 
         // Pop more data from incoming flow.
-        if let Err(e) = self.issue_incoming_pop(catnap_qd) {
+        if let Err(e) = self.issue_incoming_pop(in_libos_qd) {
             // Failed to issue pop operation, log error.
             println!("ERROR: pop failed (error={:?})", e);
         }
@@ -415,7 +421,7 @@ impl TcpProxy {
 
         // It is safe to call except() here, because `catloop_qd` is ensured to be in the table of queue descriptors.
         // All queue descriptors are registered when connection is established.
-        let catnap_qd: QDesc = *self
+        let in_libos_qd: QDesc = *self
             .incoming_qds_map
             .get(&catloop_qd)
             .expect("queue descriptor should be registered");
@@ -428,19 +434,19 @@ impl TcpProxy {
         // Push SGA to concerned incoming flow.
         let src: *mut libc::c_uchar = outgoing_sga.sga_segs[0].sgaseg_buf as *mut libc::c_uchar;
         let len: usize = outgoing_sga.sga_segs[0].sgaseg_len as usize;
-        if let Ok(incoming_sga) = self.catnap.sgaalloc(len) {
+        if let Ok(incoming_sga) = self.in_libos.sgaalloc(len) {
             // Copy.
             let dest: *mut libc::c_uchar = incoming_sga.sga_segs[0].sgaseg_buf as *mut libc::c_uchar;
             Self::copy(src, dest, len);
 
             // Issue `push()` operation.
-            if let Err(e) = self.issue_incoming_push(catnap_qd, &incoming_sga) {
+            if let Err(e) = self.issue_incoming_push(in_libos_qd, &incoming_sga) {
                 // Failed to issue push operation, log error.
                 println!("ERROR: push failed (error={:?})", e);
             }
 
             // Release incoming SGA.
-            if let Err(e) = self.catnap.sgafree(incoming_sga) {
+            if let Err(e) = self.in_libos.sgafree(incoming_sga) {
                 // Failed to release SGA, log error.
                 println!("ERROR: sgafree failed (error={:?})", e);
                 println!("WARN: leaking incoming sga");
@@ -506,13 +512,13 @@ impl TcpProxy {
     }
 
     // Closes an incoming flow.
-    fn close_client(&mut self, catnap_socket: QDesc, catloop_socket: QDesc) {
-        match self.catnap.close(catnap_socket) {
+    fn close_client(&mut self, in_libos_socket: QDesc, catloop_socket: QDesc) {
+        match self.in_libos.close(in_libos_socket) {
             Ok(_) => {
-                println!("handle cancellation of tokens (catnap_socket={:?})", catnap_socket);
-                self.incoming_qds.remove(&catnap_socket).unwrap();
-                self.outgoing_qds_map.remove(&catnap_socket).unwrap();
-                let qts_drained: HashMap<QToken, QDesc> = self.incoming_qts_map.extract_if(|_k, v| v == &catnap_socket).collect();
+                println!("handle cancellation of tokens (in_libos_socket={:?})", in_libos_socket);
+                self.incoming_qds.remove(&in_libos_socket).unwrap();
+                self.outgoing_qds_map.remove(&in_libos_socket).unwrap();
+                let qts_drained: HashMap<QToken, QDesc> = self.incoming_qts_map.extract_if(|_k, v| v == &in_libos_socket).collect();
                 let _: Vec<_> = self.incoming_qts.extract_if(|x| qts_drained.contains_key(x)).collect();
             },
             Err(e) => println!("ERROR: failed to close socket (error={:?})", e),
@@ -537,7 +543,7 @@ impl TcpProxy {
     /// returned. If the timeout expires before an operation completes, or an
     /// error is encountered, None is returned instead.
     fn poll_incoming(&mut self, timeout: Option<Duration>) -> Option<demi_qresult_t> {
-        match self.catnap.wait_any(&self.incoming_qts, timeout) {
+        match self.in_libos.wait_any(&self.incoming_qts, timeout) {
             Ok((idx, qr)) => {
                 let qt: QToken = self.incoming_qts.remove(idx);
                 // It is safe to call except() here, because `qt` is ensured to be in the table of pending operations.
@@ -587,17 +593,17 @@ impl TcpProxy {
     }
 
     /// Setups local socket.
-    fn setup_local_socket(catnap: &mut LibOS, local_addr: SocketAddr) -> Result<QDesc> {
+    fn setup_local_socket(in_libos: &mut LibOS, local_addr: SocketAddr) -> Result<QDesc> {
         // Create local socket.
-        let local_socket: QDesc = match catnap.socket(libc::AF_INET, libc::SOCK_STREAM, 0) {
+        let local_socket: QDesc = match in_libos.socket(libc::AF_INET, libc::SOCK_STREAM, 0) {
             Ok(qd) => qd,
             Err(e) => anyhow::bail!("failed to create socket: {:?}", e.cause),
         };
 
         // Bind socket to local address.
-        if let Err(e) = catnap.bind(local_socket, local_addr) {
+        if let Err(e) = in_libos.bind(local_socket, local_addr) {
             // Bind failed, close socket.
-            if let Err(e) = catnap.close(local_socket) {
+            if let Err(e) = in_libos.close(local_socket) {
                 // Close failed, log error.
                 println!("ERROR: close failed (error={:?})", e);
                 println!("WARN: leaking socket descriptor (sockqd={:?})", local_socket);
@@ -606,9 +612,9 @@ impl TcpProxy {
         };
 
         // Enable socket to accept incoming connections.
-        if let Err(e) = catnap.listen(local_socket, 16) {
+        if let Err(e) = in_libos.listen(local_socket, 16) {
             // Listen failed, close socket.
-            if let Err(e) = catnap.close(local_socket) {
+            if let Err(e) = in_libos.close(local_socket) {
                 // Close failed, log error.
                 println!("ERROR: close failed (error={:?})", e);
                 println!("WARN: leaking socket descriptor (sockqd={:?})", local_socket);
