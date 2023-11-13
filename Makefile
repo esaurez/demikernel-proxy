@@ -5,10 +5,11 @@
 # Default Paths
 #=======================================================================================================================
 
+export LIB_HOME ?= $(HOME)
+export PKG_CONFIG_PATH ?= $(shell find $(LIB_HOME)/lib/ -name '*pkgconfig*' -type d 2> /dev/null | xargs | sed -e 's/\s/:/g')
+export LD_LIBRARY_PATH ?= $(LIB_HOME)/lib:$(shell find $(LIB_HOME)/lib/ -name '*x86_64-linux-gnu*' -type d 2> /dev/null | xargs | sed -e 's/\s/:/g')
 export DEMIKERNEL_HOME ?= $(HOME)
 export CONFIG_PATH ?= $(DEMIKERNEL_HOME)/config.yaml
-export PKG_CONFIG_PATH ?= $(shell find $(DEMIKERNEL_HOME)/lib/ -name '*pkgconfig*' -type d 2> /dev/null | xargs | sed -e 's/\s/:/g')
-export LD_LIBRARY_PATH ?= $(DEMIKERNEL_HOME)/lib:$(shell find $(DEMIKERNEL_HOME)/lib/ -name '*x86_64-linux-gnu*' -type d 2> /dev/null | xargs | sed -e 's/\s/:/g')
 
 export PREFIX ?= $(HOME)
 export PKG_CONFIG_PATH ?= $(shell find $(PREFIX)/lib/ -name '*pkgconfig*' -type d 2> /dev/null | xargs | sed -e 's/\s/:/g')
@@ -55,7 +56,7 @@ export CARGO_FEATURES := --features=$(LIBOS)-libos
 # Switch for DPDK
 ifeq ($(LIBOS),catnip)
 DRIVER ?= $(shell [ ! -z "`lspci | grep -E "ConnectX-[4,5,6]"`" ] && echo mlx5 || echo mlx4)
-CARGO_FEATURES += --features=demikernel/$(DRIVER)
+CARGO_FEATURES += --features=$(DRIVER)
 endif
 
 # Enable VM Shared Memory

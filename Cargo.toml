@@ -35,8 +35,8 @@ demikernel = { git = "https://github.com/esaurez/demikernel", branch = "feature-
 [features]
 default = [ "catnap-libos" ]
 catnap-libos = [ "demikernel/catnap-libos", "demikernel/catloop-libos" ]
-virtio-shmem = [ "demikernel/virtio-shmem" ]
 catnip-libos = [ "demikernel/catnip-libos", "demikernel/catloop-libos" ]
+virtio-shmem = [ "demikernel/virtio-shmem" ]
 mlx4 = ["demikernel/mlx4"]
 mlx5 = ["demikernel/mlx5"]
 
