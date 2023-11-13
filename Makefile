@@ -7,6 +7,8 @@
 
 export DEMIKERNEL_HOME ?= $(HOME)
 export CONFIG_PATH ?= $(DEMIKERNEL_HOME)/config.yaml
+export PKG_CONFIG_PATH ?= $(shell find $(DEMIKERNEL_HOME)/lib/ -name '*pkgconfig*' -type d 2> /dev/null | xargs | sed -e 's/\s/:/g')
+export LD_LIBRARY_PATH ?= $(DEMIKERNEL_HOME)/lib:$(shell find $(DEMIKERNEL_HOME)/lib/ -name '*x86_64-linux-gnu*' -type d 2> /dev/null | xargs | sed -e 's/\s/:/g')
 
 export PREFIX ?= $(HOME)
 export PKG_CONFIG_PATH ?= $(shell find $(PREFIX)/lib/ -name '*pkgconfig*' -type d 2> /dev/null | xargs | sed -e 's/\s/:/g')
@@ -21,6 +23,9 @@ ifeq ($(DEBUG),yes)
 export RUST_LOG ?= trace
 export BUILD := dev
 endif
+
+export MTU ?= 1500
+export MSS ?= 1500
 
 #=======================================================================================================================
 # Project Directories
@@ -47,6 +52,7 @@ export CARGO_FLAGS += --profile $(BUILD)
 export LIBOS ?= catnap
 export CARGO_FEATURES := --features=$(LIBOS)-libos
 
+# Switch for DPDK
 ifeq ($(LIBOS),catnip)
 DRIVER ?= $(shell [ ! -z "`lspci | grep -E "ConnectX-[4,5,6]"`" ] && echo mlx5 || echo mlx4)
 CARGO_FEATURES += --features=demikernel/$(DRIVER)
