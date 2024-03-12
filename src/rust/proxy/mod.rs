@@ -1,5 +1,4 @@
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
 
 #![feature(never_type)]
 #![feature(extract_if)]
@@ -8,7 +7,6 @@
 //======================================================================================================================
 // Imports
 //======================================================================================================================
-
 use ::anyhow::Result;
 #[cfg(feature = "virtio-shmem")]
 use ::demikernel::pal::linux::virtio_shmem::SharedMemory;
@@ -23,17 +21,16 @@ use ::demikernel::{
     QDesc,
     QToken,
 };
-use std::net::SocketAddr;
 use ::std::{
     collections::HashMap,
-    env,
     slice,
-    str::FromStr,
-    time::{
-        Duration,
-        Instant,
-    },
+    time::Duration,
 };
+use std::{net::SocketAddr, sync::mpsc::{channel, Sender, Receiver}, fmt::Debug};
+
+//======================================================================================================================
+// Imports
+//======================================================================================================================
 
 #[cfg(target_os = "windows")]
 pub const AF_INET: i32 = windows::Win32::Networking::WinSock::AF_INET.0 as i32;
@@ -48,9 +45,50 @@ pub const AF_INET: i32 = libc::AF_INET;
 pub const SOCK_STREAM: i32 = libc::SOCK_STREAM;
 
 //======================================================================================================================
-// server()
+// Traits
 //======================================================================================================================
+pub struct AddRequest {
+    vm_id: String,
+    local_address: SocketAddr,
+    in_libos: String,
+    remote_addr: SocketAddr,
+}
 
+pub enum ProxyRequest {
+    // Add a new proxy
+    Add(AddRequest),
+    // String is the VM ID
+    Remove(String),
+}
+
+
+pub trait ProxyManager : Send + Sync + Debug {
+    fn add_proxy(
+        &mut self,
+        vm_id: &str,
+        local_addr: SocketAddr,
+        in_libos: String,
+        remote_addr: SocketAddr,
+    ) -> Result<()>;
+    fn remove_proxy(&mut self, vm_id: &str) -> Result<()>;
+}
+
+pub trait ProxyRun {
+    fn run(event_receiver: Receiver<ProxyRequest>) -> Result<()>;
+}
+
+pub trait Proxy {
+    fn non_blocking_poll(
+        &mut self,
+        timeout_incoming: Option<Duration>,
+        timeout_outgoing: Option<Duration>,
+    ) -> Result<()>;
+    fn issue_accept(&mut self) -> Result<()>;
+}
+
+//======================================================================================================================
+// Structures
+//======================================================================================================================
 struct TcpProxy {
     /// LibOS that handles incoming flow.
     in_libos: LibOS,
@@ -80,6 +118,17 @@ struct TcpProxy {
     outgoing_qts_map: HashMap<QToken, QDesc>,
 }
 
+
+
+
+pub struct NetProxyManager {
+    // Sender for the control plane
+    req_send: Sender<ProxyRequest>,
+}
+
+//======================================================================================================================
+// Associated Functions
+//======================================================================================================================
 impl TcpProxy {
     /// Expected length for the array of pending incoming operations.
     /// It controls the pre-allocated size of the array.
@@ -91,15 +140,9 @@ impl TcpProxy {
     const OUTGOING_LENGTH: usize = 1024;
 
     /// Instantiates a TCP proxy that accepts incoming flows from `local_addr` and forwards them to `remote_addr`.
-    pub fn new(local_addr: SocketAddr, remote_addr: SocketAddr) -> Result<Self> {
-        // Retrieve LibOS name from environment variables.
-        let libos_name: LibOSName = match LibOSName::from_env() {
-            Ok(libos_name) => libos_name.into(),
-            Err(e) => anyhow::bail!("{:?}", e),
-        };
-
+    pub fn new(local_addr: SocketAddr, libos_name: String, remote_addr: SocketAddr) -> Result<Self> {
         // Instantiate LibOS for handling incoming flows.
-        let mut in_libos: LibOS = match LibOS::new(libos_name) {
+        let mut in_libos: LibOS = match LibOS::new(libos_name.into()) {
             Ok(libos) => libos,
             Err(e) => anyhow::bail!("failed to initialize libos (error={:?})", e),
         };
@@ -130,88 +173,6 @@ impl TcpProxy {
         })
     }
 
-    /// Runs the target TCP proxy.
-    pub fn run(&mut self) -> Result<!> {
-        // Time interval for dumping logs and statistics.
-        // This was arbitrarily set, but keep in mind that too short intervals may negatively impact performance.
-        let log_interval: Option<Duration> = Some(Duration::from_secs(1));
-        // Time stamp when last log was dumped.
-        let mut last_log: Instant = Instant::now();
-        // Timeout for polling incoming operations.This was intentionally set to zero to force no waiting.
-        let timeout_incoming: Option<Duration> = Some(Duration::from_secs(0));
-        // Timeout for polling outgoing operations. This was intentionally set to zero to force no waiting.
-        let timeout_outgoing: Option<Duration> = Some(Duration::from_secs(0));
-
-        // Initialize the shared memory for catloop
-        #[cfg(feature = "virtio-shmem")]
-        SharedMemory::initialize_static_mem_manager();
-
-        // Accept incoming connections.
-        self.issue_accept()?;
-
-        loop {
-            // Dump statistics.
-            if let Some(log_interval) = log_interval {
-                if last_log.elapsed() > log_interval {
-                    println!("INFO: {:?} clients connected", self.nclients);
-                    last_log = Instant::now();
-                }
-            }
-
-            // Poll incoming flows.
-            if let Some(qr) = self.poll_incoming(timeout_incoming) {
-                // Parse operation result.
-                match qr.qr_opcode {
-                    demi_opcode_t::DEMI_OPC_ACCEPT => self.handle_incoming_accept(&qr)?,
-                    demi_opcode_t::DEMI_OPC_POP => self.handle_incoming_pop(&qr),
-                    demi_opcode_t::DEMI_OPC_PUSH => self.handle_incoming_push(&qr),
-                    demi_opcode_t::DEMI_OPC_FAILED => {
-                        // Check if this is an unrecoverable error.
-                        if qr.qr_ret != libc::ECONNRESET as i64 {
-                            anyhow::bail!("operation failed")
-                        }
-                        println!("WARN: client reset connection");
-                        let in_libos_qd: QDesc = qr.qr_qd.into();
-                        // It is safe to expect here because the queue descriptor must have been registered.
-                        // All queue descriptors are registered when the connection is established.
-                        let catloop_qd: QDesc = *self
-                            .outgoing_qds_map
-                            .get(&in_libos_qd)
-                            .expect("queue descriptor not registered");
-                        self.close_client(in_libos_qd, catloop_qd);
-                    },
-                    _ => unreachable!(),
-                };
-            }
-
-            // Poll outgoing flows.
-            if let Some(qr) = self.poll_outgoing(timeout_outgoing) {
-                // Parse operation result.
-                match qr.qr_opcode {
-                    demi_opcode_t::DEMI_OPC_CONNECT => self.handle_outgoing_connect(&qr),
-                    demi_opcode_t::DEMI_OPC_POP => self.handle_outgoing_pop(&qr),
-                    demi_opcode_t::DEMI_OPC_PUSH => self.handle_outgoing_push(&qr),
-                    demi_opcode_t::DEMI_OPC_FAILED => {
-                        // Check if this is an unrecoverable error.
-                        if qr.qr_ret != libc::ECONNRESET as i64 {
-                            anyhow::bail!("operation failed")
-                        }
-                        println!("WARN: server reset connection");
-                        let catloop_socket: QDesc = qr.qr_qd.into();
-                        // It is safe to expect() here because the queue descriptor must have been registered.
-                        // All queue descriptors are registered when the connection is established.
-                        let in_libos_socket: QDesc = *self
-                            .incoming_qds_map
-                            .get(&catloop_socket)
-                            .expect("queue descriptor not registered");
-                        self.close_client(in_libos_socket, catloop_socket);
-                    },
-                    _ => unreachable!(),
-                };
-            }
-        }
-    }
-
     /// Registers an incoming operation that is waiting for completion (pending).
     /// This function fails if the operation is already registered in the table of pending incoming operations.
     fn register_incoming_operation(&mut self, qd: QDesc, qt: QToken) -> Result<()> {
@@ -229,14 +190,6 @@ impl TcpProxy {
             anyhow::bail!("outgoing operation is already registered (qt={:?})", qt);
         }
         self.outgoing_qts.push(qt);
-        Ok(())
-    }
-
-    /// Issues an `accept()`operation.
-    /// This function fails if the underlying `accept()` operation fails.
-    fn issue_accept(&mut self) -> Result<()> {
-        let qt: QToken = self.in_libos.accept(self.local_socket)?;
-        self.register_incoming_operation(self.local_socket, qt)?;
         Ok(())
     }
 
@@ -530,7 +483,10 @@ impl TcpProxy {
                 println!("handle cancellation of tokens (in_libos_socket={:?})", in_libos_socket);
                 self.incoming_qds.remove(&in_libos_socket).unwrap();
                 self.outgoing_qds_map.remove(&in_libos_socket).unwrap();
-                let qts_drained: HashMap<QToken, QDesc> = self.incoming_qts_map.extract_if(|_k, v| v == &in_libos_socket).collect();
+                let qts_drained: HashMap<QToken, QDesc> = self
+                    .incoming_qts_map
+                    .extract_if(|_k, v| v == &in_libos_socket)
+                    .collect();
                 let _: Vec<_> = self.incoming_qts.extract_if(|x| qts_drained.contains_key(x)).collect();
             },
             Err(e) => println!("ERROR: failed to close socket (error={:?})", e),
@@ -541,7 +497,8 @@ impl TcpProxy {
                 println!("handle cancellation of tokens (catloop_socket={:?})", catloop_socket);
                 self.outgoing_qds.remove(&catloop_socket).unwrap();
                 self.incoming_qds_map.remove(&catloop_socket).unwrap();
-                let qts_drained: HashMap<QToken, QDesc> = self.outgoing_qts_map.extract_if(|_k, v| v == &catloop_socket).collect();
+                let qts_drained: HashMap<QToken, QDesc> =
+                    self.outgoing_qts_map.extract_if(|_k, v| v == &catloop_socket).collect();
                 let _: Vec<_> = self.outgoing_qts.extract_if(|x| qts_drained.contains_key(x)).collect();
             },
             Err(e) => println!("ERROR: failed to close socket (error={:?})", e),
@@ -636,23 +593,196 @@ impl TcpProxy {
 
         Ok(local_socket)
     }
+
+    /// Issues an `accept()`operation.
+    /// This function fails if the underlying `accept()` operation fails.
+    fn issue_accept(&mut self) -> Result<()> {
+        let qt: QToken = self.in_libos.accept(self.local_socket)?;
+        self.register_incoming_operation(self.local_socket, qt)?;
+        Ok(())
+    }
 }
 
-//======================================================================================================================
-// main()
-//======================================================================================================================
-
-pub fn main() -> Result<()> {
-    let args: Vec<String> = env::args().collect();
-
-    // Check command line arguments.
-    if args.len() < 3 {
-        println!("Usage: {} local-address remote-address\n", &args[0]);
-        return Ok(());
+impl Proxy for TcpProxy {
+    fn issue_accept(&mut self) -> Result<()> {
+        self.issue_accept()
     }
 
-    let local_addr: SocketAddr = SocketAddr::from_str(&args[1])?;
-    let remote_addr: SocketAddr = SocketAddr::from_str(&args[2])?;
-    let mut proxy: TcpProxy = TcpProxy::new(local_addr, remote_addr)?;
-    proxy.run()?;
+    fn non_blocking_poll(
+        &mut self,
+        timeout_incoming: Option<Duration>,
+        timeout_outgoing: Option<Duration>,
+    ) -> Result<()> {
+        // Poll incoming flows.
+        if let Some(qr) = self.poll_incoming(timeout_incoming) {
+            // Parse operation result.
+            match qr.qr_opcode {
+                demi_opcode_t::DEMI_OPC_ACCEPT => self.handle_incoming_accept(&qr)?,
+                demi_opcode_t::DEMI_OPC_POP => self.handle_incoming_pop(&qr),
+                demi_opcode_t::DEMI_OPC_PUSH => self.handle_incoming_push(&qr),
+                demi_opcode_t::DEMI_OPC_FAILED => {
+                    // Check if this is an unrecoverable error.
+                    if qr.qr_ret != libc::ECONNRESET as i64 {
+                        anyhow::bail!("operation failed")
+                    }
+                    println!("WARN: client reset connection");
+                    let in_libos_qd: QDesc = qr.qr_qd.into();
+                    // It is safe to expect here because the queue descriptor must have been registered.
+                    // All queue descriptors are registered when the connection is established.
+                    let catloop_qd: QDesc = *self
+                        .outgoing_qds_map
+                        .get(&in_libos_qd)
+                        .expect("queue descriptor not registered");
+                    self.close_client(in_libos_qd, catloop_qd);
+                },
+                _ => unreachable!(),
+            };
+        }
+
+        // Poll outgoing flows.
+        if let Some(qr) = self.poll_outgoing(timeout_outgoing) {
+            // Parse operation result.
+            match qr.qr_opcode {
+                demi_opcode_t::DEMI_OPC_CONNECT => self.handle_outgoing_connect(&qr),
+                demi_opcode_t::DEMI_OPC_POP => self.handle_outgoing_pop(&qr),
+                demi_opcode_t::DEMI_OPC_PUSH => self.handle_outgoing_push(&qr),
+                demi_opcode_t::DEMI_OPC_FAILED => {
+                    // Check if this is an unrecoverable error.
+                    if qr.qr_ret != libc::ECONNRESET as i64 {
+                        anyhow::bail!("operation failed")
+                    }
+                    println!("WARN: server reset connection");
+                    let catloop_socket: QDesc = qr.qr_qd.into();
+                    // It is safe to expect() here because the queue descriptor must have been registered.
+                    // All queue descriptors are registered when the connection is established.
+                    let in_libos_socket: QDesc = *self
+                        .incoming_qds_map
+                        .get(&catloop_socket)
+                        .expect("queue descriptor not registered");
+                    self.close_client(in_libos_socket, catloop_socket);
+                },
+                _ => unreachable!(),
+            };
+        }
+
+        Ok(())
+    }
+}
+
+impl NetProxyManager {
+    #[allow(dead_code)]
+    pub fn new() -> (Self, Receiver<ProxyRequest>) {
+        // Create a channel
+        let (req_send, req_recv) = channel();
+
+        (
+            NetProxyManager {
+                req_send 
+            },
+            req_recv
+        )
+    }
+}
+
+impl ProxyRun for NetProxyManager {
+    fn run(event_receiver: Receiver<ProxyRequest>) -> Result<()> {
+            // Map from device id (str) to TcpProxy
+            // This is used to keep track of all the active proxies
+            let mut proxy_map: HashMap<String, Box<dyn Proxy>> = HashMap::new();
+
+            // Time interval for dumping logs and statistics.
+            // Timeout for polling incoming operations.This was intentionally set to zero to force no waiting.
+            let timeout_incoming: Option<Duration> = Some(Duration::from_secs(0));
+            // Timeout for polling outgoing operations. This was intentionally set to zero to force no waiting.
+            let timeout_outgoing: Option<Duration> = Some(Duration::from_secs(0));
+            // Number of iterations after which the processing thread check for control plane ops
+            let op_iteration_wait = 1000;
+
+            // Initialize the shared memory for catloop
+            #[cfg(feature = "virtio-shmem")]
+            SharedMemory::initialize_static_mem_manager();
+            
+
+
+            let mut control_counter: usize = 0;
+            for (_, proxy) in proxy_map.iter_mut() {
+                match proxy.issue_accept() {
+                    Ok(_) => {},
+                    Err(e) => {
+                        // Log and panic 
+                        // \TODO Better error handling
+                        panic!("Error issuing accept: {:?}", e);
+                    }
+                }
+            }
+            loop {
+                // \TODO: Only poll on active proxies
+                for (_, proxy) in proxy_map.iter_mut() {
+                    match proxy.non_blocking_poll(timeout_incoming, timeout_outgoing) {
+                        Ok(_) => {},
+                        Err(e) => {
+                            // Log and panic 
+                            // \TODO Better error handling
+                            panic!("Error polling proxy: {:?}", e);
+                        }
+                    }
+                }
+
+                control_counter += 1;
+                if control_counter == op_iteration_wait {
+                    control_counter = 0;
+                    match event_receiver.try_recv() {
+                        Ok(request) => {
+                            match request {
+                                ProxyRequest::Add(proxy_req) => {
+                                    // \TODO move this out of the critical path, this can be an expensive operation
+                                    let new_proxy = Box::new(TcpProxy::new(proxy_req.local_address, proxy_req.in_libos, proxy_req.remote_addr)?);
+                                    proxy_map.insert(proxy_req.vm_id, new_proxy);
+                                },
+                                ProxyRequest::Remove(vm_id) => {
+                                    proxy_map.remove(&vm_id);
+                                },
+                            } 
+                        } 
+                        Err(_) => {
+                            // \TODO: Better handle errors 
+                        }
+                    }
+                } 
+            }
+    }
+}
+
+impl Debug for NetProxyManager {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "NetProxyManager")
+    }
+}
+
+impl ProxyManager for NetProxyManager {
+    fn add_proxy(
+        &mut self,
+        vm_id: &str,
+        local_address: SocketAddr,
+        in_libos: String,
+        remote_addr: SocketAddr,
+    ) -> Result<()> {
+        let request = 
+            ProxyRequest::Add(AddRequest {
+                vm_id: vm_id.to_string(),
+                local_address,
+                in_libos,
+                remote_addr,
+            });
+        self.req_send.send(request)?;
+        Ok(())
+    }
+
+    fn remove_proxy(&mut self, vm_id: &str) -> Result<()> {
+        let request: ProxyRequest = ProxyRequest::Remove(vm_id.to_string());
+        self.req_send.send(request)?;
+        Ok(())
+    }
+
+    
 }

@@ -1,0 +1,44 @@
+#=======================================================================================================================
+# Package
+#=======================================================================================================================
+
+[package]
+name = "proxy"
+authors = ["Microsoft Corporation"]
+edition = "2021"
+resolver = "2"
+
+#=======================================================================================================================
+# Dependencies 
+#=======================================================================================================================
+
+[dependencies]
+# Demikernel Organization
+demikernel = { git = "https://github.com/esaurez/demikernel", branch = "feature-pal-nimble_shared_memory"}
+
+anyhow.workspace = true
+libc.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+# libc implementation in Rust is quite different for Windows and Linux. This library provides the relevant networking
+# constants and data structures for Windows.
+windows = { version = "0.52.0", features = [
+    "Win32_Networking_WinSock",
+] }
+
+#=======================================================================================================================
+# Features 
+#=======================================================================================================================
+
+[features]
+catnap-libos = [ "demikernel/catnap-libos", "demikernel/catloop-libos" ]
+catnip-libos = [ "demikernel/catnip-libos", "demikernel/catloop-libos" ]
+virtio-shmem = [ "demikernel/virtio-shmem" ]
+nimble-shmem = [ "demikernel/nimble-shmem" ]
+mlx4 = ["demikernel/mlx4"]
+mlx5 = ["demikernel/mlx5"]
+
+[lib]
+name = "proxy"
+crate-type = ["cdylib", "rlib"]
+path = "mod.rs"

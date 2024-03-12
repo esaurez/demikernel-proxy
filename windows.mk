@@ -46,6 +46,10 @@ MTU = 1500
 MSS = 1500
 !endif
 
+!ifndef X86_64_LXUTIL_DLL_DIR
+X86_64_LXUTIL_DLL_DIR = $(USERPROFILE)\Src\hvlite2\.packages\Microsoft.WSL.LxUtil.amd64fre\build\native\bin
+!endif
+
 #=======================================================================================================================
 # Project Directories
 #=======================================================================================================================
@@ -73,14 +77,14 @@ CARGO_FLAGS = $(CARGO_FLAGS) --profile $(BUILD)
 !ifndef LIBOS
 LIBOS = catnap
 !endif
-CARGO_FEATURES = $(CARGO_FEATURES) --features=$(LIBOS)-libos
+CARGO_FEATURES = $(CARGO_FEATURES) --features=proxy/$(LIBOS)-libos
 
 # Switch for DPDK
 !if "$(LIBOS)" == "catnip"
 !ifndef DRIVER
 DRIVER = mlx5	# defaults to mlx5, set the DRIVER env var if you want to change this
 !endif
-CARGO_FEATURES = $(CARGO_FEATURES) --features=$(DRIVER)
+CARGO_FEATURES = $(CARGO_FEATURES) --features=proxy/$(DRIVER)
 !endif
 
 # Enable VM Shared Memory
@@ -88,8 +92,7 @@ CARGO_FEATURES = $(CARGO_FEATURES) --features=$(DRIVER)
 VM_SHM = no
 !endif
 !if "$(VM_SHM)" == "yes"
-CARGO_FEATURES = $(CARGO_FEATURES) --features=demikernel/nimble-shmem
-CARGO_FEATURES = $(CARGO_FEATURES) --features=nimble-shmem
+CARGO_FEATURES = $(CARGO_FEATURES) --features=proxy/nimble-shmem
 !endif
 
 #=======================================================================================================================

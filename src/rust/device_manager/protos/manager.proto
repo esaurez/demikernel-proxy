@@ -1,0 +1,25 @@
+syntax = "proto3";
+package manager;
+
+service NetManager {
+    rpc AddDevice (DeviceConfig) returns (ManagerResponse);
+    rpc RemoveDevice (DeviceConfig) returns (ManagerResponse);
+}
+
+message DeviceConfig {
+	string nimble_device_unique_id = 1;
+	string nimble_clsid = 2;
+	string vm_id = 3;
+  string interface = 4;
+	string net_address = 5;
+	string vm_address = 6;
+	string demikernel_libos_type = 7;	
+}
+
+message ManagerResponse {
+	enum Status {
+		OK = 0;
+		FAILED = 1;
+	}
+	Status status = 1;
+}

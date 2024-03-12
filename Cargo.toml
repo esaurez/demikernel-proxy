@@ -1,52 +1,25 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT license.
 
-#=======================================================================================================================
-# Package
-#=======================================================================================================================
-
-[package]
-name = "demikernel-proxy"
-version = "0.1.0"
-authors = ["Microsoft Corporation"]
-edition = "2021"
-description = "A TCP Proxy Application"
-homepage = "https://aka.ms/demikernel"
-repository = "https://github.com/demikernel/demikernel-proxy"
-license-file = "LICENSE.txt"
+[workspace]
+resolver = "2"
+members = [
+	"src/exec",
+	"src/rust/device_manager",
+	"src/rust/proxy",
+]
 
 #=======================================================================================================================
 # Dependencies
 #=======================================================================================================================
-
-[dependencies]
-
+[workspace.dependencies]
 # Third Party
 anyhow = "1.0.75"
 libc = "0.2.149"
 
-# Demikernel Organization
-demikernel = { git = "https://github.com/esaurez/demikernel", branch = "feature-pal-nimble_shared_memory"}
-
-[target.'cfg(windows)'.dependencies]
-# libc implementation in Rust is quite different for Windows and Linux. This library provides the relevant networking
-# constants and data structures for Windows.
-windows = { version = "0.52.0", features = [
-    "Win32_Networking_WinSock",
-] }
-
-#=======================================================================================================================
-# Features
-#=======================================================================================================================
-
-[features]
-default = [ "catnap-libos" ]
-catnap-libos = [ "demikernel/catnap-libos", "demikernel/catloop-libos" ]
-catnip-libos = [ "demikernel/catnip-libos", "demikernel/catloop-libos" ]
-virtio-shmem = [ "demikernel/virtio-shmem" ]
-nimble-shmem = [ "demikernel/nimble-shmem" ]
-mlx4 = ["demikernel/mlx4"]
-mlx5 = ["demikernel/mlx5"]
+tonic = "0.11"
+prost = "0.12"
+tokio = "1.0"
 
 #=======================================================================================================================
 # Profile
