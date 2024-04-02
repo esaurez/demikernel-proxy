@@ -133,8 +133,8 @@ doc:
 
 # Cleans up all build artifacts.
 clean:
-	rm -rf target ; \
-	rm -f Cargo.lock ; \
+	del /F target  
+	del /F Cargo.lock 
 	$(CARGO) clean
 
 # Check code style formatting.

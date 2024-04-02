@@ -23,6 +23,7 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 hdv = { path = "../../../../hvlite2/hcs/hdv" }
 hcs_sample_lib = { path = "../../../../hvlite2/hcs/src" }
 guid = { path = "../../../../hvlite2/support/guid" }
+sparse_mmap = { path =  "../../../../hvlite2/support/sparse_mmap" }
 
 [target.'cfg(windows)'.dependencies]
 winapi = { version = "0.3.9" }

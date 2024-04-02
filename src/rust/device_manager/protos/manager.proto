@@ -2,18 +2,25 @@ syntax = "proto3";
 package manager;
 
 service NetManager {
-    rpc AddDevice (DeviceConfig) returns (ManagerResponse);
-    rpc RemoveDevice (DeviceConfig) returns (ManagerResponse);
+	  rpc AddDeviceEmulator(DeviceEmulatorConfig) returns (ManagerResponse);
+    rpc AddDeviceNetwork (DeviceNetworkConfig) returns (ManagerResponse);
+    rpc RemoveDeviceEmulator(DeviceEmulatorConfig) returns (ManagerResponse);
+    rpc RemoveDeviceNetwork (DeviceNetworkConfig) returns (ManagerResponse);
 }
 
-message DeviceConfig {
+message DeviceEmulatorConfig {
 	string nimble_device_unique_id = 1;
 	string nimble_clsid = 2;
 	string vm_id = 3;
-  string interface = 4;
-	string net_address = 5;
-	string vm_address = 6;
-	string demikernel_libos_type = 7;	
+}
+
+message DeviceNetworkConfig {
+	string nimble_device_unique_id = 1;
+	string vm_id = 2;
+  string interface = 3;
+	string net_address = 4;
+	string vm_address = 5;
+	string demikernel_libos_type = 6;	
 }
 
 message ManagerResponse {
