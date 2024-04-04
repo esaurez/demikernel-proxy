@@ -13,11 +13,10 @@ resolver = "2"
 #=======================================================================================================================
 
 [dependencies]
-# Demikernel Organization
-demikernel = { git = "https://github.com/esaurez/demikernel", branch = "feature-pal-nimble_shared_memory"}
-
 anyhow.workspace = true
+demikernel.workspace = true
 libc.workspace = true
+yaml-rust = "0.4.5"
 
 [target.'cfg(windows)'.dependencies]
 # libc implementation in Rust is quite different for Windows and Linux. This library provides the relevant networking
@@ -25,10 +24,6 @@ libc.workspace = true
 windows = { version = "0.52.0", features = [
     "Win32_Networking_WinSock",
 ] }
-
-#=======================================================================================================================
-# Features 
-#=======================================================================================================================
 
 [features]
 catnap-libos = [ "demikernel/catnap-libos", "demikernel/catloop-libos" ]

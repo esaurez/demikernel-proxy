@@ -77,14 +77,14 @@ CARGO_FLAGS = $(CARGO_FLAGS) --profile $(BUILD)
 !ifndef LIBOS
 LIBOS = catnap
 !endif
-CARGO_FEATURES = $(CARGO_FEATURES) --features=proxy/$(LIBOS)-libos
+CARGO_FEATURES = $(CARGO_FEATURES) --features=$(LIBOS)-libos
 
 # Switch for DPDK
 !if "$(LIBOS)" == "catnip"
 !ifndef DRIVER
 DRIVER = mlx5	# defaults to mlx5, set the DRIVER env var if you want to change this
 !endif
-CARGO_FEATURES = $(CARGO_FEATURES) --features=proxy/$(DRIVER)
+CARGO_FEATURES = $(CARGO_FEATURES) --features=$(DRIVER)
 !endif
 
 # Enable VM Shared Memory
@@ -92,7 +92,7 @@ CARGO_FEATURES = $(CARGO_FEATURES) --features=proxy/$(DRIVER)
 VM_SHM = no
 !endif
 !if "$(VM_SHM)" == "yes"
-CARGO_FEATURES = $(CARGO_FEATURES) --features=proxy/nimble-shmem
+CARGO_FEATURES = $(CARGO_FEATURES) --features=nimble-shmem
 !endif
 
 #=======================================================================================================================

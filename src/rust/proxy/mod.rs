@@ -11,6 +11,7 @@ use ::anyhow::Result;
 #[cfg(feature = "virtio-shmem")]
 use ::demikernel::pal::linux::virtio_shmem::SharedMemory;
 use ::demikernel::{
+    demikernel::config::Config,
     demi_sgarray_t,
     runtime::types::{
         demi_opcode_t,
@@ -21,12 +22,24 @@ use ::demikernel::{
     QDesc,
     QToken,
 };
+use ::yaml_rust::{
+    Yaml,
+    YamlLoader,
+};
 use ::std::{
     collections::HashMap,
     slice,
     time::Duration,
 };
-use std::{net::SocketAddr, sync::mpsc::{channel, Sender, Receiver}, fmt::Debug};
+use std::{
+    fmt::Debug,
+    net::SocketAddr,
+    sync::mpsc::{
+        channel,
+        Receiver,
+        Sender,
+    },
+};
 
 //======================================================================================================================
 // Imports
@@ -61,8 +74,7 @@ pub enum ProxyRequest {
     Remove(String),
 }
 
-
-pub trait ProxyManager : Send + Sync + Debug {
+pub trait ProxyManager: Send + Sync + Debug {
     fn add_proxy(
         &mut self,
         vm_id: &str,
@@ -118,9 +130,6 @@ struct TcpProxy {
     outgoing_qts_map: HashMap<QToken, QDesc>,
 }
 
-
-
-
 pub struct NetProxyManager {
     // Sender for the control plane
     req_send: Sender<ProxyRequest>,
@@ -140,15 +149,26 @@ impl TcpProxy {
     const OUTGOING_LENGTH: usize = 1024;
 
     /// Instantiates a TCP proxy that accepts incoming flows from `local_addr` and forwards them to `remote_addr`.
-    pub fn new(local_addr: SocketAddr, libos_name: String, remote_addr: SocketAddr) -> Result<Self> {
+    pub fn new(vm_id: &str, local_addr: SocketAddr, libos_name: String, remote_addr: SocketAddr) -> Result<Self> {
         // Instantiate LibOS for handling incoming flows.
         let mut in_libos: LibOS = match LibOS::new(libos_name.into()) {
             Ok(libos) => libos,
             Err(e) => anyhow::bail!("failed to initialize libos (error={:?})", e),
         };
 
+        let catmem_config: String = format!("
+catmem:
+    name_prefix: {}
+", vm_id);
+        let config= YamlLoader::load_from_str(&catmem_config).unwrap();
+        let config_obj: &Yaml = match &config[..] {
+            &[ref c] => c,
+            _ => Err(anyhow::format_err!("Wrong number of config objects")).unwrap(),
+        };
+
+        let demi_config = Config { 0: config_obj.clone() };
         // Instantiate LibOS for handling outgoing flows.
-        let catloop: LibOS = match LibOS::new(LibOSName::Catloop) {
+        let catloop: LibOS = match LibOS::new_with_config(LibOSName::Catloop, demi_config) {
             Ok(libos) => libos,
             Err(e) => anyhow::bail!("failed to initialize libos (error={:?})", e),
         };
@@ -675,81 +695,87 @@ impl NetProxyManager {
         // Create a channel
         let (req_send, req_recv) = channel();
 
-        (
-            NetProxyManager {
-                req_send 
-            },
-            req_recv
-        )
+        (NetProxyManager { req_send }, req_recv)
     }
 }
 
 impl ProxyRun for NetProxyManager {
     fn run(event_receiver: Receiver<ProxyRequest>) -> Result<()> {
-            // Map from device id (str) to TcpProxy
-            // This is used to keep track of all the active proxies
-            let mut proxy_map: HashMap<String, Box<dyn Proxy>> = HashMap::new();
+        // Map from device id (str) to TcpProxy
+        // This is used to keep track of all the active proxies
+        let mut proxy_map: HashMap<String, Box<dyn Proxy>> = HashMap::new();
 
-            // Time interval for dumping logs and statistics.
-            // Timeout for polling incoming operations.This was intentionally set to zero to force no waiting.
-            let timeout_incoming: Option<Duration> = Some(Duration::from_secs(0));
-            // Timeout for polling outgoing operations. This was intentionally set to zero to force no waiting.
-            let timeout_outgoing: Option<Duration> = Some(Duration::from_secs(0));
-            // Number of iterations after which the processing thread check for control plane ops
-            let op_iteration_wait = 1000;
+        // Time interval for dumping logs and statistics.
+        // Timeout for polling incoming operations.This was intentionally set to zero to force no waiting.
+        let timeout_incoming: Option<Duration> = Some(Duration::from_secs(0));
+        // Timeout for polling outgoing operations. This was intentionally set to zero to force no waiting.
+        let timeout_outgoing: Option<Duration> = Some(Duration::from_secs(0));
+        // Number of iterations after which the processing thread check for control plane ops
+        let op_iteration_wait = 1000;
 
-            // Initialize the shared memory for catloop
-            #[cfg(feature = "virtio-shmem")]
-            SharedMemory::initialize_static_mem_manager();
-            
+        // Initialize the shared memory for catloop
+        #[cfg(feature = "virtio-shmem")]
+        SharedMemory::initialize_static_mem_manager();
 
-
-            let mut control_counter: usize = 0;
+        let mut control_counter: usize = 0;
+        for (_, proxy) in proxy_map.iter_mut() {
+            match proxy.issue_accept() {
+                Ok(_) => {},
+                Err(e) => {
+                    // Log and panic
+                    // \TODO Better error handling
+                    panic!("Error issuing accept: {:?}", e);
+                },
+            }
+        }
+        loop {
+            // \TODO: Only poll on active proxies
             for (_, proxy) in proxy_map.iter_mut() {
-                match proxy.issue_accept() {
+                match proxy.non_blocking_poll(timeout_incoming, timeout_outgoing) {
                     Ok(_) => {},
                     Err(e) => {
-                        // Log and panic 
+                        // Log and panic
                         // \TODO Better error handling
-                        panic!("Error issuing accept: {:?}", e);
-                    }
+                        panic!("Error polling proxy: {:?}", e);
+                    },
                 }
             }
-            loop {
-                // \TODO: Only poll on active proxies
-                for (_, proxy) in proxy_map.iter_mut() {
-                    match proxy.non_blocking_poll(timeout_incoming, timeout_outgoing) {
-                        Ok(_) => {},
-                        Err(e) => {
-                            // Log and panic 
-                            // \TODO Better error handling
-                            panic!("Error polling proxy: {:?}", e);
-                        }
-                    }
-                }
 
-                control_counter += 1;
-                if control_counter == op_iteration_wait {
-                    control_counter = 0;
-                    match event_receiver.try_recv() {
-                        Ok(request) => {
-                            match request {
-                                ProxyRequest::Add(proxy_req) => {
-                                    // \TODO move this out of the critical path, this can be an expensive operation
-                                    let new_proxy = Box::new(TcpProxy::new(proxy_req.local_address, proxy_req.in_libos, proxy_req.remote_addr)?);
-                                    proxy_map.insert(proxy_req.vm_id, new_proxy);
-                                },
-                                ProxyRequest::Remove(vm_id) => {
-                                    proxy_map.remove(&vm_id);
-                                },
-                            } 
-                        } 
-                        Err(_) => {
-                            // \TODO: Better handle errors 
+            control_counter += 1;
+            if control_counter == op_iteration_wait {
+                control_counter = 0;
+                match event_receiver.try_recv() {
+                    Ok(request) => {
+                        match request {
+                            ProxyRequest::Add(proxy_req) => {
+                                // \TODO move this out of the critical path, this can be an expensive operation
+                                let mut new_proxy = Box::new(TcpProxy::new(
+                                    &proxy_req.vm_id,
+                                    proxy_req.local_address,
+                                    proxy_req.in_libos,
+                                    proxy_req.remote_addr,
+                                )?);
+                                match new_proxy.issue_accept() {
+                                    Ok(_) => {},
+                                    Err(e) => {
+                                        // Log and panic
+                                        // \TODO Better error handling
+                                        panic!("Error issuing accept: {:?}", e);
+                                    },
+                                }
+                                proxy_map.insert(proxy_req.vm_id, new_proxy);
+                            },
+                            ProxyRequest::Remove(vm_id) => {
+                                proxy_map.remove(&vm_id);
+                            },
                         }
-                    }
-                } 
+                    },
+                    Err(_) => {
+                        // \TODO: Better handle errors
+                    },
+                }
             }
+        }
     }
 }
 
@@ -767,13 +793,12 @@ impl ProxyManager for NetProxyManager {
         in_libos: String,
         remote_addr: SocketAddr,
     ) -> Result<()> {
-        let request = 
-            ProxyRequest::Add(AddRequest {
-                vm_id: vm_id.to_string(),
-                local_address,
-                in_libos,
-                remote_addr,
-            });
+        let request = ProxyRequest::Add(AddRequest {
+            vm_id: vm_id.to_string(),
+            local_address,
+            in_libos,
+            remote_addr,
+        });
         self.req_send.send(request)?;
         Ok(())
     }
@@ -783,6 +808,4 @@ impl ProxyManager for NetProxyManager {
         self.req_send.send(request)?;
         Ok(())
     }
-
-    
 }

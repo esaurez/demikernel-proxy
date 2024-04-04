@@ -13,6 +13,7 @@ edition = "2021"
 [dependencies]
 # internal
 proxy = { path = "../proxy" }
+demikernel.workspace = true
 
 # gRPC
 tonic.workspace = true
@@ -27,6 +28,14 @@ sparse_mmap = { path =  "../../../../hvlite2/support/sparse_mmap" }
 
 [target.'cfg(windows)'.dependencies]
 winapi = { version = "0.3.9" }
+
+[features]
+catnap-libos = [ "demikernel/catnap-libos", "demikernel/catloop-libos" ]
+catnip-libos = [ "demikernel/catnip-libos", "demikernel/catloop-libos" ]
+virtio-shmem = [ "demikernel/virtio-shmem" ]
+nimble-shmem = [ "demikernel/nimble-shmem" ]
+mlx4 = ["demikernel/mlx4"]
+mlx5 = ["demikernel/mlx5"]
 
 [build-dependencies]
 tonic-build = "0.11"

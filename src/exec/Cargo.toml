@@ -16,6 +16,7 @@ resolver = "2"
 anyhow.workspace = true
 tonic.workspace = true
 tokio.workspace = true
+demikernel.workspace = true
 device_manager = { path = "../rust/device_manager" }
 proxy = { path = "../rust/proxy" }
 
@@ -24,12 +25,12 @@ proxy = { path = "../rust/proxy" }
 #=======================================================================================================================
 
 [features]
-catnap-libos = [ "proxy/catnap-libos" ]
-catnip-libos = [ "proxy/catnip-libos" ]
-virtio-shmem = [ "proxy/virtio-shmem" ]
-nimble-shmem = [ "proxy/nimble-shmem" ]
-mlx4 = ["proxy/mlx4"]
-mlx5 = ["proxy/mlx5"]
+catnap-libos = [ "demikernel/catnap-libos", "demikernel/catloop-libos" ]
+catnip-libos = [ "demikernel/catnip-libos", "demikernel/catloop-libos" ]
+virtio-shmem = [ "demikernel/virtio-shmem" ]
+nimble-shmem = [ "demikernel/nimble-shmem" ]
+mlx4 = ["demikernel/mlx4"]
+mlx5 = ["demikernel/mlx5"]
 
 [[bin]]
 name = "proxy_exe"

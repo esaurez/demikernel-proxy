@@ -11,21 +11,31 @@ use hdv::{
         HdvApi,
         HdvDynDevice,
     },
-    virtio_nimble::add_virtio_nimble_device,
     virtio_hdv::{
         HdvGuestMemoryCache,
         GUEST_MEMORY_DEFAULT_CACHE_SIZE,
+    },
+    virtio_nimble::{
+        add_virtio_nimble_device,
+        Segment,
+        SegmentsManager,
+        ShmemManager,
+        SharedMemory as VirtioSharedMemory,
     },
 };
 
 use std::{
     collections::HashMap,
     net::SocketAddr,
+    ops::{
+        Deref,
+        DerefMut,
+    },
+    str::FromStr,
     sync::{
         Arc,
         Mutex,
     },
-    str::FromStr, 
 };
 use tonic::{
     Request,
@@ -42,6 +52,16 @@ use manager::{
     ManagerResponse,
 };
 
+use demikernel::pal::windows::{
+    nimble_shm::SharedMemory,
+    virtio_shmem_lib::base::{
+        Fail,
+        NimbleResult,
+        RegionLocation,
+        RegionManager,
+        RegionTrait,
+    },
+};
 use proxy::ProxyManager;
 
 //======================================================================================================================
@@ -53,13 +73,21 @@ pub mod manager {
 }
 
 // Expose ProxyManagerServer as a public module
-pub use manager::net_manager_server as net_manager_server;
+pub use manager::net_manager_server;
 
 #[derive(Debug)]
 pub struct ManagerService {
-    proxy_manager: Arc<Mutex<Box<dyn ProxyManager>>>, 
+    proxy_manager: Arc<Mutex<Box<dyn ProxyManager>>>,
     // Map from VM_ID to store the devices
     devices: Arc<Mutex<HashMap<String, HdvDynDevice>>>,
+}
+
+pub struct ShmRegionManager {
+    shm_manager: Arc<Mutex<Option<ShmemManager>>>,
+}
+
+pub struct SharedRegionMemory {
+    shmem: VirtioSharedMemory,
 }
 
 //======================================================================================================================
@@ -75,9 +103,92 @@ impl ManagerService {
     }
 }
 
+//======================================================================================================================
+// Trait Implementations
+//======================================================================================================================
+
+/// Dereference trait implementation.
+impl Deref for SharedRegionMemory {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        &self.shmem
+    }
+}
+
+/// Mutable dereference trait implementation.
+impl DerefMut for SharedRegionMemory {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.shmem
+    }
+}
+
+impl RegionTrait for SharedRegionMemory {}
+
+impl RegionManager for ShmRegionManager {
+    fn create_region(&mut self, segment_name: &str, segment_size: u64) -> NimbleResult<RegionLocation> {
+        let mut shm = self.shm_manager.lock().unwrap();
+
+        let shm_lock = shm.as_mut().ok_or_else(|| Fail {
+            errno: 0,
+            cause: "Failed to lock the shared memory manager".to_string(),
+        })?;
+        match shm_lock.create_region(segment_name, segment_size) {
+            Ok(region) => Ok(RegionLocation {
+                offset: region.offset,
+                size: region.size,
+            }),
+            Err(_) => Err(Fail {
+                errno: 0,
+                cause: "Failed to create region".to_string(),
+            }),
+        }
+    }
+
+    fn get_region(&mut self, segment_name: &str) -> NimbleResult<RegionLocation> {
+        let mut shm = self.shm_manager.lock().unwrap();
+        let shm_lock = shm.as_mut().ok_or_else(|| Fail {
+            errno: 0,
+            cause: "Failed to lock the shared memory manager".to_string(),
+        })?;
+        match shm_lock.get_region(segment_name) {
+            Ok(region) => Ok(RegionLocation {
+                offset: region.offset,
+                size: region.size,
+            }),
+            Err(_) => Err(Fail {
+                errno: 0,
+                cause: "Failed to create region".to_string(),
+            }),
+        }
+    }
+
+    fn mmap_region(&mut self, region_location: &RegionLocation) -> NimbleResult<Box<dyn RegionTrait<Target = [u8]>>> {
+        let mut shm = self.shm_manager.lock().unwrap();
+        let shm_lock = shm.as_mut().ok_or_else(|| Fail {
+            errno: 0,
+            cause: "Failed to lock the shared memory manager".to_string(),
+        })?;
+        match shm_lock.mmap_region(&Segment {
+            offset: region_location.offset,
+            size: region_location.size,
+        }) {
+            Ok(shared_memory) => Ok(Box::new(SharedRegionMemory { shmem: shared_memory })),
+            Err(_) => Err(Fail {
+                errno: 0,
+                cause: "Failed to mmap region".to_string(),
+            }),
+        }
+    }
+}
+
+
 #[tonic::async_trait]
 impl NetManager for ManagerService {
-    async fn add_device_emulator(&self, request: Request<DeviceEmulatorConfig>) -> Result<Response<ManagerResponse>, Status> {
+    async fn add_device_emulator(
+        &self,
+        request: Request<DeviceEmulatorConfig>,
+    ) -> Result<Response<ManagerResponse>, Status> {
         let r = request.into_inner();
         let vm_id = r.vm_id.clone();
         let serverless_id = Guid::from_str(&r.nimble_device_unique_id).unwrap();
@@ -107,14 +218,28 @@ impl NetManager for ManagerService {
         // create a sparse mmap section of the corresponding size
         let section = sparse_mmap::alloc_shared_memory(size);
 
+        let shm_manager_arc: Arc<Mutex<Option<ShmemManager>>> = Arc::new(Mutex::new(None));
+
+
+        let shm_region_box = Box::new(ShmRegionManager {
+            shm_manager: shm_manager_arc.clone(),
+        });
+
+        let shm_region_manager = Arc::new(Mutex::new(shm_region_box as Box<dyn RegionManager>));
+
+        SharedMemory::add_manager(&vm_id, shm_region_manager);
+
         let serverless = add_virtio_nimble_device(
-                &host,
-                shared_cache.clone(),
-                &GUID::from(serverless_id),
-                section_name,
-                section.unwrap() as sparse_mmap::Mappable,
-                size,
-            );
+            &host,
+            shared_cache.clone(),
+            &GUID::from(serverless_id),
+            section_name,
+            section.unwrap() as sparse_mmap::Mappable,
+            size,
+            shm_manager_arc,
+        );
+
+        // Add the shm_manager to
 
         if let Err(result) = serverless {
             eprintln!("AddServerlessUvmDevice failed: HRESULT {:x}", result);
@@ -129,14 +254,21 @@ impl NetManager for ManagerService {
         }))
     }
 
-
-    async fn add_device_network(&self, request: Request<DeviceNetworkConfig>) -> Result<Response<ManagerResponse>, Status> {
+    async fn add_device_network(
+        &self,
+        request: Request<DeviceNetworkConfig>,
+    ) -> Result<Response<ManagerResponse>, Status> {
         let r = request.into_inner();
         // Add the device to the proxy manager
         // \TODO: Use better error handling
         let net_socket_addr = SocketAddr::from_str(&r.net_address).unwrap();
         let vm_socket_addr = SocketAddr::from_str(&r.vm_address).unwrap();
-        let add_result = self.proxy_manager.lock().unwrap().add_proxy(&r.vm_id, net_socket_addr, r.demikernel_libos_type , vm_socket_addr);
+        let add_result = self.proxy_manager.lock().unwrap().add_proxy(
+            &r.vm_id,
+            net_socket_addr,
+            r.demikernel_libos_type,
+            vm_socket_addr,
+        );
         if let Err(result) = add_result {
             eprintln!("AddProxy failed: {:?}", result);
             return Err(Status::internal("error adding proxy"));
@@ -147,7 +279,10 @@ impl NetManager for ManagerService {
         }))
     }
 
-    async fn remove_device_emulator(&self, request: Request<DeviceEmulatorConfig>) -> Result<Response<ManagerResponse>, Status> {
+    async fn remove_device_emulator(
+        &self,
+        request: Request<DeviceEmulatorConfig>,
+    ) -> Result<Response<ManagerResponse>, Status> {
         let r = request.into_inner();
 
         // Remove the device from the map
@@ -158,7 +293,10 @@ impl NetManager for ManagerService {
         }))
     }
 
-    async fn remove_device_network(&self, request: Request<DeviceNetworkConfig>) -> Result<Response<ManagerResponse>, Status> {
+    async fn remove_device_network(
+        &self,
+        request: Request<DeviceNetworkConfig>,
+    ) -> Result<Response<ManagerResponse>, Status> {
         let r = request.into_inner();
 
         // Remove the device from the proxy manager
@@ -173,3 +311,4 @@ impl NetManager for ManagerService {
         }))
     }
 }
+
