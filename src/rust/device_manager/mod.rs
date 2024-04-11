@@ -211,8 +211,8 @@ impl NetManager for ManagerService {
         let host = host.unwrap();
         let shared_cache = Arc::new(HdvGuestMemoryCache::new(GUEST_MEMORY_DEFAULT_CACHE_SIZE));
 
-        // shared memory section is 64 KB
-        let size = 64 * 1024;
+        // shared memory section is 512 KB
+        let size = 512 * 1024;
         // section name is the vm id as a string
         let section_name = vm_id.to_string();
         // create a sparse mmap section of the corresponding size
@@ -307,6 +307,27 @@ impl NetManager for ManagerService {
         }
 
         Ok(Response::new(ManagerResponse {
+            status: manager_response::Status::Ok as i32,
+        }))
+    }
+
+    async fn run_eval(
+        &self,
+        request: Request<manager::EvalConfig>,
+    ) -> Result<Response<manager::ManagerResponse>, Status> {
+        let r = request.into_inner();
+        let iterations = r.iterations;
+        let data_size = r.data_size;
+        let vm_id = r.vm_id;
+        let segment_name = r.segment_name;
+        let segment_size: u32 = r.segment_size;
+
+        let eval_result = self.proxy_manager.lock().unwrap().run_eval(&vm_id, &segment_name, data_size, iterations, segment_size);
+        if let Err(result) = eval_result {
+            eprintln!("RunEval failed: {:?}", result);
+            return Err(Status::internal("error running eval"));
+        }
+        Ok(Response::new(manager::ManagerResponse{
             status: manager_response::Status::Ok as i32,
         }))
     }

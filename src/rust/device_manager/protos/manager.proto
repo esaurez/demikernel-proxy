@@ -6,6 +6,7 @@ service NetManager {
     rpc AddDeviceNetwork (DeviceNetworkConfig) returns (ManagerResponse);
     rpc RemoveDeviceEmulator(DeviceEmulatorConfig) returns (ManagerResponse);
     rpc RemoveDeviceNetwork (DeviceNetworkConfig) returns (ManagerResponse);
+		rpc RunEval(EvalConfig) returns (ManagerResponse);
 }
 
 message DeviceEmulatorConfig {
@@ -29,4 +30,12 @@ message ManagerResponse {
 		FAILED = 1;
 	}
 	Status status = 1;
+}
+
+message EvalConfig {
+	string vm_id = 1;
+	string segment_name = 2;
+	uint32 iterations = 3;
+	uint32 data_size = 4;
+	uint32 segment_size = 5;
 }

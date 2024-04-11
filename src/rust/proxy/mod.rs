@@ -10,6 +10,9 @@
 use ::anyhow::Result;
 #[cfg(feature = "virtio-shmem")]
 use ::demikernel::pal::linux::virtio_shmem::SharedMemory;
+// This feature is only for windows and nimble-shmem
+#[cfg(all(feature = "nimble-shmem", target_os = "windows"))]
+use ::demikernel::pal::windows::nimble_shm::SharedMemory;
 use ::demikernel::{
     demikernel::config::Config,
     demi_sgarray_t,
@@ -32,13 +35,11 @@ use ::std::{
     time::Duration,
 };
 use std::{
-    fmt::Debug,
-    net::SocketAddr,
-    sync::mpsc::{
+    fmt::Debug, io::Write, net::SocketAddr, sync::mpsc::{
         channel,
         Receiver,
         Sender,
-    },
+    }, time::Instant
 };
 
 //======================================================================================================================
@@ -67,11 +68,21 @@ pub struct AddRequest {
     remote_addr: SocketAddr,
 }
 
+pub struct EvalRequest {
+    vm_id: String,
+    segment_name: String,
+    data_size: u32,
+    iterations: u32,
+    segment_size: u32,
+}
+
 pub enum ProxyRequest {
     // Add a new proxy
     Add(AddRequest),
     // String is the VM ID
     Remove(String),
+    // Run an evaluation
+    RunEval(EvalRequest),
 }
 
 pub trait ProxyManager: Send + Sync + Debug {
@@ -83,6 +94,7 @@ pub trait ProxyManager: Send + Sync + Debug {
         remote_addr: SocketAddr,
     ) -> Result<()>;
     fn remove_proxy(&mut self, vm_id: &str) -> Result<()>;
+    fn run_eval(&mut self, vm_id: &str, segment_name: &str, data_size: u32, iterations: u32, segment_size: u32) -> Result<()>;
 }
 
 pub trait ProxyRun {
@@ -96,6 +108,7 @@ pub trait Proxy {
         timeout_outgoing: Option<Duration>,
     ) -> Result<()>;
     fn issue_accept(&mut self) -> Result<()>;
+    fn run_eval(&mut self, eval: EvalRequest) -> Result<()>;
 }
 
 //======================================================================================================================
@@ -153,7 +166,10 @@ impl TcpProxy {
         // Instantiate LibOS for handling incoming flows.
         let mut in_libos: LibOS = match LibOS::new(libos_name.into()) {
             Ok(libos) => libos,
-            Err(e) => anyhow::bail!("failed to initialize libos (error={:?})", e),
+            Err(e) => {
+                println!("failed to initialize libos (error={:?})", e);
+                anyhow::bail!("failed to initialize libos (error={:?})", e)
+            },
         };
 
         let catmem_config: String = format!("
@@ -170,7 +186,10 @@ catmem:
         // Instantiate LibOS for handling outgoing flows.
         let catloop: LibOS = match LibOS::new_with_config(LibOSName::Catloop, demi_config) {
             Ok(libos) => libos,
-            Err(e) => anyhow::bail!("failed to initialize libos (error={:?})", e),
+            Err(e) => {
+                println!("failed to initialize libos (error={:?})", e);
+                anyhow::bail!("failed to initialize libos (error={:?})", e)
+            },
         };
 
         // Setup local socket.
@@ -291,7 +310,10 @@ catmem:
         // Setup remote connection.
         let new_server_socket: QDesc = match self.catloop.socket(AF_INET, SOCK_STREAM, 0) {
             Ok(qd) => qd,
-            Err(e) => anyhow::bail!("failed to create socket: {:?}", e.cause),
+            Err(e) => {
+                println!("ERROR: failed to create socket (error={:?})", e);
+                anyhow::bail!("failed to create socket: {:?}", e.cause)
+            },
         };
 
         // Connect to remote address.
@@ -313,6 +335,7 @@ catmem:
         if let Err(e) = self.issue_accept() {
             // Failed to issue accept operation, log error.
             println!("ERROR: accept failed (error={:?})", e);
+            return Err(e);
         };
 
         self.incoming_qds.insert(new_client_socket, false);
@@ -586,7 +609,10 @@ catmem:
         // Create local socket.
         let local_socket: QDesc = match in_libos.socket(AF_INET, SOCK_STREAM, 0) {
             Ok(qd) => qd,
-            Err(e) => anyhow::bail!("failed to create socket: {:?}", e.cause),
+            Err(e) => { 
+                println!("ERROR: failed to create socket (error={:?})", e);
+                anyhow::bail!("failed to create socket: {:?}", e.cause)
+            },
         };
 
         // Bind socket to local address.
@@ -687,6 +713,62 @@ impl Proxy for TcpProxy {
 
         Ok(())
     }
+
+
+    fn run_eval(&mut self, eval: EvalRequest) -> Result<()> {
+        // Start a thread that will run the evaluation
+        std::thread::spawn(move || {
+            // Start time measurement
+            let begin = Instant::now();
+            // Get the segment
+            let formatted_name = format!("{}-{}", eval.vm_id, eval.segment_name);
+            let mut segment = match SharedMemory::open(&formatted_name, eval.segment_size as usize) {
+                Ok(segment) => segment,
+                Err(e) => {
+                    // Log and panic
+                    // \TODO Better error handling
+                    println!("Error getting segment: {:?}", e);
+                    return;
+                },
+            };
+
+            let shm = segment.as_mut_ptr();
+
+            let end_segment_creation = Instant::now();
+            let segment_nano_duration =  end_segment_creation.duration_since(begin).as_nanos();
+            println!("Segment creation took: {} ns", segment_nano_duration);
+
+            let input_data = vec![1u8; eval.data_size as usize];    
+            let begin_iteration = Instant::now();
+            for _ in 0..eval.iterations {
+                // Create a slice from the shared memory
+                let mut segment_slice = unsafe { std::slice::from_raw_parts_mut(shm, eval.segment_size as usize) };
+                // Write data to the segment
+                match segment_slice.write_all(input_data.as_slice()) {
+                    Ok(_) => {},
+                    Err(e) => {
+                        // Log and panic
+                        // \TODO Better error handling
+                        println!("Error writing to segment: {:?}", e);
+                        return;
+                    },
+                }
+
+                // Create a slice from the shared memory
+                let read_slice = unsafe { std::slice::from_raw_parts(shm, eval.segment_size as usize) };
+
+                // wait for the segment slice to be zeros again
+                while read_slice.iter().any(|&x| x != 0) {
+                    // Do nothing and poll
+                }
+            }
+            let end_iteration = Instant::now();
+            // Get the average in nanoseconds
+            let iteration_nano_duration = (end_iteration.duration_since(begin_iteration).as_nanos() as f64) / (eval.iterations as f64);
+            println!("Iteration took: {} ns in average", iteration_nano_duration);
+        });
+        Ok(())
+    }
 }
 
 impl NetProxyManager {
@@ -724,7 +806,8 @@ impl ProxyRun for NetProxyManager {
                 Err(e) => {
                     // Log and panic
                     // \TODO Better error handling
-                    panic!("Error issuing accept: {:?}", e);
+                    println!("Error issuing accept: {:?}", e);
+                    return Err(e);
                 },
             }
         }
@@ -736,7 +819,8 @@ impl ProxyRun for NetProxyManager {
                     Err(e) => {
                         // Log and panic
                         // \TODO Better error handling
-                        panic!("Error polling proxy: {:?}", e);
+                        println!("Error polling proxy: {:?}", e);
+                        continue;
                     },
                 }
             }
@@ -747,26 +831,47 @@ impl ProxyRun for NetProxyManager {
                 match event_receiver.try_recv() {
                     Ok(request) => {
                         match request {
+
                             ProxyRequest::Add(proxy_req) => {
-                                // \TODO move this out of the critical path, this can be an expensive operation
-                                let mut new_proxy = Box::new(TcpProxy::new(
+                                let proxy = match TcpProxy::new(
                                     &proxy_req.vm_id,
                                     proxy_req.local_address,
                                     proxy_req.in_libos,
                                     proxy_req.remote_addr,
-                                )?);
+                                ) {
+                                    Ok(proxy) => proxy,
+                                    Err(e) => {
+                                        // Log and panic
+                                        // \TODO Better error handling
+                                        println!("Error creating proxy: {:?}", e);
+                                        continue;
+                                    },
+                                };
+
+                                // \TODO move this out of the critical path, this can be an expensive operation
+                                let mut new_proxy = Box::new(proxy);
                                 match new_proxy.issue_accept() {
                                     Ok(_) => {},
                                     Err(e) => {
                                         // Log and panic
                                         // \TODO Better error handling
-                                        panic!("Error issuing accept: {:?}", e);
+                                        println!("Error issuing accept: {:?}", e);
+                                        continue;
                                     },
                                 }
                                 proxy_map.insert(proxy_req.vm_id, new_proxy);
                             },
                             ProxyRequest::Remove(vm_id) => {
                                 proxy_map.remove(&vm_id);
+                            },
+                            ProxyRequest::RunEval(eval_req) => {
+                                match proxy_map.get_mut(&eval_req.vm_id) {
+                                    Some(proxy) => proxy.run_eval(eval_req).unwrap(),
+                                    None => {
+                                        println!("Error: could not find vm {:?}", &eval_req.vm_id);
+                                        continue;
+                                    },
+                                }
                             },
                         }
                     },
@@ -805,6 +910,18 @@ impl ProxyManager for NetProxyManager {
 
     fn remove_proxy(&mut self, vm_id: &str) -> Result<()> {
         let request: ProxyRequest = ProxyRequest::Remove(vm_id.to_string());
+        self.req_send.send(request)?;
+        Ok(())
+    }
+
+    fn run_eval(&mut self, vm_id: &str, segment_name: &str, data_size: u32, iterations: u32, segment_size: u32) -> Result<()> {
+        let request: ProxyRequest = ProxyRequest::RunEval( EvalRequest{
+            vm_id: vm_id.to_string(),
+            segment_name: segment_name.to_string(),
+            data_size,
+            iterations,
+            segment_size,
+        });
         self.req_send.send(request)?;
         Ok(())
     }

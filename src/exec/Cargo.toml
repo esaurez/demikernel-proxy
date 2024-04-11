@@ -35,3 +35,7 @@ mlx5 = ["demikernel/mlx5"]
 [[bin]]
 name = "proxy_exe"
 path = "main.rs"
+
+[[bin]]
+name = "eval_aux"
+path = "eval.rs"
