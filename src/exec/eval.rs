@@ -7,13 +7,14 @@
 use ::anyhow::Result;
 use std::env;
 
-use device_manager::manager::net_manager_client::NetManagerClient;
-use device_manager::manager::EvalConfig;
+use device_manager::manager::{
+    net_manager_client::NetManagerClient,
+    EvalConfig,
+};
 
 //======================================================================================================================
 // main()
 //======================================================================================================================
-
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -23,7 +24,10 @@ async fn main() -> Result<()> {
 
     // Check command line arguments.
     if args.len() < 6 {
-        println!("Usage: {} vm_id segment_name num_iters data_size segment_size\n", &args[0]);
+        println!(
+            "Usage: {} vm_id segment_name num_iters data_size segment_size\n",
+            &args[0]
+        );
         return Ok(());
     }
 
@@ -35,7 +39,6 @@ async fn main() -> Result<()> {
 
     let addr: String = format!("http://{}:{}", IP, PORT).parse()?;
     let mut client = NetManagerClient::connect(addr).await?;
-
 
     let request = tonic::Request::new(EvalConfig {
         vm_id: vm_id.clone(),

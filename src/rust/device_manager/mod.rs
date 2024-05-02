@@ -19,8 +19,8 @@ use hdv::{
         add_virtio_nimble_device,
         Segment,
         SegmentsManager,
-        ShmemManager,
         SharedMemory as VirtioSharedMemory,
+        ShmemManager,
     },
 };
 
@@ -182,7 +182,6 @@ impl RegionManager for ShmRegionManager {
     }
 }
 
-
 #[tonic::async_trait]
 impl NetManager for ManagerService {
     async fn add_device_emulator(
@@ -219,7 +218,6 @@ impl NetManager for ManagerService {
         let section = sparse_mmap::alloc_shared_memory(size);
 
         let shm_manager_arc: Arc<Mutex<Option<ShmemManager>>> = Arc::new(Mutex::new(None));
-
 
         let shm_region_box = Box::new(ShmRegionManager {
             shm_manager: shm_manager_arc.clone(),
@@ -322,14 +320,17 @@ impl NetManager for ManagerService {
         let segment_name = r.segment_name;
         let segment_size: u32 = r.segment_size;
 
-        let eval_result = self.proxy_manager.lock().unwrap().run_eval(&vm_id, &segment_name, data_size, iterations, segment_size);
+        let eval_result =
+            self.proxy_manager
+                .lock()
+                .unwrap()
+                .run_eval(&vm_id, &segment_name, data_size, iterations, segment_size);
         if let Err(result) = eval_result {
             eprintln!("RunEval failed: {:?}", result);
             return Err(Status::internal("error running eval"));
         }
-        Ok(Response::new(manager::ManagerResponse{
+        Ok(Response::new(manager::ManagerResponse {
             status: manager_response::Status::Ok as i32,
         }))
     }
 }
-
