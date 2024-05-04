@@ -45,6 +45,8 @@ async fn main() -> Result<()> {
         ProxyType::Tcp
     } else if proxy_type_str == "udp" {
         ProxyType::Udp
+    } else if proxy_type_str == "udp-tcp" {
+        ProxyType::UdpTcp
     } else {
         return Err(anyhow::anyhow!("Invalid proxy type"));
     };

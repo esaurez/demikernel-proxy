@@ -146,6 +146,7 @@ pub trait Proxy {
 pub enum ProxyType {
     Tcp,
     Udp,
+    UdpTcp,
 }
 
 impl Clone for ProxyType {
@@ -153,6 +154,7 @@ impl Clone for ProxyType {
         match self {
             Self::Tcp => Self::Tcp,
             Self::Udp => Self::Udp,
+            Self::UdpTcp => Self::UdpTcp,
         }
     }
 }
@@ -211,6 +213,31 @@ struct UdpProxy {
     outgoing_qts: Vec<QToken>,
 }
 
+struct UdpTcpProxy {
+    /// LibOS that handles incoming flow.
+    in_libos: LibOS,
+    /// LibOS that handles outgoing flow.   
+    catloop: LibOS,
+    /// Remote socket address to forward packets to.
+    remote_addr: SocketAddr,
+    /// Socket to receive incoming packets.
+    local_socket: QDesc,
+    // UDP for incoming
+    /// Incoming operations that are pending.
+    incoming_qts: Vec<QToken>,
+    /// Maps an incoming address to its respective outgoing socket
+    incoming_client_map: HashMap<SocketAddr, QDesc>,
+    // TCP for outgoing
+    /// Queue descriptors of outgoing connections.
+    outgoing_qds: HashMap<QDesc, bool>,
+    /// Maps a queue descriptor of an outgoing connection to its respective incoming connection.
+    outgoing_qds_map: HashMap<QDesc, SocketAddr>,
+    /// Outgoing operations that are pending.
+    outgoing_qts: Vec<QToken>,
+    /// Maps a pending outgoing operation to its respective queue descriptor.
+    outgoing_qts_map: HashMap<QToken, QDesc>,
+}
+
 pub struct NetProxyManager {
     // Sender for the control plane
     req_send: Sender<ProxyRequest>,
@@ -244,8 +271,11 @@ impl TcpProxy {
             "
 catmem:
     name_prefix: {}
+catnip:
+    my_ipv4_addr: {}
 ",
-            vm_id
+            vm_id,
+            remote_addr.ip().to_string()
         );
         let config = YamlLoader::load_from_str(&catmem_config).unwrap();
         let config_obj: &Yaml = match &config[..] {
@@ -875,8 +905,11 @@ impl UdpProxy {
             "
 catmem:
     name_prefix: {}
+catnip:
+    my_ipv4_addr: {}
 ",
-            vm_id
+            vm_id,
+            remote_addr.ip().to_string()
         );
         let config = YamlLoader::load_from_str(&catmem_config).unwrap();
         let config_obj: &Yaml = match &config[..] {
@@ -1019,8 +1052,14 @@ catmem:
             anyhow::bail!("communication domain not supported");
         };
         // Extracting IPv4 address and port
-        let ip_octets = unsafe { addr_in.sin_addr.S_un.S_addr.to_ne_bytes() };
-        let ipv4_addr = Ipv4Addr::new(ip_octets[0], ip_octets[1], ip_octets[2], ip_octets[3]);
+        let ipv4_addr = unsafe {
+            Ipv4Addr::new(
+                addr_in.sin_addr.S_un.S_un_b.s_b4,
+                addr_in.sin_addr.S_un.S_un_b.s_b3,
+                addr_in.sin_addr.S_un.S_un_b.s_b2,
+                addr_in.sin_addr.S_un.S_un_b.s_b1,
+            )
+        };
         let port: u16 = u16::from_be(addr_in.sin_port);
 
         // Creating SocketAddrV4
@@ -1301,6 +1340,9 @@ impl Proxy for UdpProxy {
                 demi_opcode_t::DEMI_OPC_PUSH => self.handle_incoming_push()?,
                 demi_opcode_t::DEMI_OPC_FAILED => {
                     println!("ERROR: incoming operation failed (error={:?})", qr.qr_ret);
+                    if let Err(e) = self.issue_incoming_pop(self.local_socket) {
+                        println!("ERROR: failed to issue incoming pop (error={:?})", e);
+                    }
                     anyhow::bail!("operation failed")
                 },
                 demi_opcode_t::DEMI_OPC_ACCEPT => self.handle_unexpected("incoming_accept", &qr)?,
@@ -1318,6 +1360,10 @@ impl Proxy for UdpProxy {
                 demi_opcode_t::DEMI_OPC_PUSH => self.handle_outgoing_push(&qr)?,
                 demi_opcode_t::DEMI_OPC_FAILED => {
                     println!("ERROR: outgoing operation failed (error={:?})", qr.qr_ret);
+                    let catloop_qd: QDesc = qr.qr_qd.into();
+                    if let Err(e) = self.issue_outgoing_pop(catloop_qd) {
+                        println!("ERROR: failed to issue outgoing pop (error={:?})", e);
+                    }
                     anyhow::bail!("operation failed")
                 },
                 demi_opcode_t::DEMI_OPC_ACCEPT => self.handle_unexpected("outgoing_accept", &qr)?,
@@ -1353,6 +1399,527 @@ impl Drop for UdpProxy {
     }
 }
 
+impl UdpTcpProxy {
+    /// Expected length for the array of pending incoming operations.
+    /// It controls the pre-allocated size of the array.
+    /// Change this value accordingly so as to avoid allocations on the datapath.
+    const INCOMING_LENGTH: usize = 1024;
+    /// Expected length for the array of pending outgoing operations.
+    /// It controls the pre-allocated size of the array.
+    /// Change this value accordingly so as to avoid allocations on the datapath.
+    const OUTGOING_LENGTH: usize = 1024;
+
+    /// Instantiates a TCP proxy that accepts incoming flows from `local_addr` and forwards them to `remote_addr`.
+    pub fn new(vm_id: &str, local_addr: SocketAddr, libos_name: String, remote_addr: SocketAddr) -> Result<Self> {
+        // Instantiate LibOS for handling incoming flows.
+        let mut in_libos: LibOS = match LibOS::new(libos_name.into()) {
+            Ok(libos) => libos,
+            Err(e) => {
+                println!("failed to initialize libos (error={:?})", e);
+                anyhow::bail!("failed to initialize libos (error={:?})", e)
+            },
+        };
+
+        let catmem_config: String = format!(
+            "
+catmem:
+    name_prefix: {}
+catnip:
+    my_ipv4_addr: {}
+",
+            vm_id,
+            remote_addr.ip().to_string()
+        );
+        let config = YamlLoader::load_from_str(&catmem_config).unwrap();
+        let config_obj: &Yaml = match &config[..] {
+            &[ref c] => c,
+            _ => Err(anyhow::format_err!("Wrong number of config objects")).unwrap(),
+        };
+
+        let demi_config = Config { 0: config_obj.clone() };
+        // Instantiate LibOS for handling outgoing flows.
+        let catloop: LibOS = match LibOS::new_with_config(LibOSName::Catloop, demi_config) {
+            Ok(libos) => libos,
+            Err(e) => {
+                println!("failed to initialize libos (error={:?})", e);
+                anyhow::bail!("failed to initialize libos (error={:?})", e)
+            },
+        };
+
+        // Setup local socket.
+        let local_socket: QDesc = Self::setup_local_socket(&mut in_libos, local_addr)?;
+
+        Ok(Self {
+            in_libos,
+            catloop,
+            remote_addr,
+            local_socket,
+            incoming_qts: Vec::with_capacity(Self::INCOMING_LENGTH),
+            incoming_client_map: HashMap::default(),
+            outgoing_qts: Vec::with_capacity(Self::OUTGOING_LENGTH),
+            outgoing_qts_map: HashMap::default(),
+            outgoing_qds: HashMap::default(),
+            outgoing_qds_map: (HashMap::default()),
+        })
+    }
+
+    /// Registers an incoming operation that is waiting for completion (pending).
+    fn register_incoming_operation(&mut self, qt: QToken) {
+        self.incoming_qts.push(qt);
+    }
+
+    /// Registers an outgoing operation that is waiting for completion (pending).
+    /// This function fails if the operation is already registered in the table of pending outgoing operations.
+    fn register_outgoing_operation(&mut self, qd: QDesc, qt: QToken) -> Result<()> {
+        if self.outgoing_qts_map.insert(qt, qd).is_some() {
+            anyhow::bail!("outgoing operation is already registered (qt={:?})", qt);
+        }
+        self.outgoing_qts.push(qt);
+        Ok(())
+    }
+
+    /// Issues a `pushto()` operation in an incoming flow.
+    /// This function fails if the underlying `push()` operation fails.
+    fn issue_incoming_pushto(&mut self, qd: QDesc, sga: &demi_sgarray_t) -> Result<()> {
+        let address = match self.outgoing_qds_map.get(&qd) {
+            Some(address) => address,
+            None => {
+                return Err(anyhow::format_err!("No address found for incoming push"));
+            },
+        };
+        let qt: QToken = self.in_libos.pushto(qd, &sga, *address)?;
+
+        // It is safe to call except() here, because we just issued the `push()` operation,
+        // queue tokens are unique, and thus the operation is ensured to not be registered.
+        self.register_incoming_operation(qt);
+
+        Ok(())
+    }
+
+    /// Issues a `pop()` operation in an incoming flow.
+    /// This function fails if the underlying `pop()` operation fails.
+    fn issue_incoming_pop(&mut self, qd: QDesc) -> Result<()> {
+        let qt: QToken = self.in_libos.pop(qd, None)?;
+
+        // It is safe to call except() here, because we just issued the `pop()` operation,
+        // queue tokens are unique, and thus the operation is ensured to not be registered.
+        self.register_incoming_operation(qt);
+        Ok(())
+    }
+
+    /// Issues a `push()` operation in an outgoing flow.
+    /// This function fails if the underlying `push()` operation fails.
+    fn issue_outgoing_push(&mut self, qd: QDesc, sga: &demi_sgarray_t) -> Result<()> {
+        let qt: QToken = self.catloop.push(qd, &sga)?;
+
+        // It is safe to call except() here, because we just issued the `push()` operation,
+        // queue tokens are unique, and thus the operation is ensured to not be registered.
+        self.register_outgoing_operation(qd, qt)
+            .expect("outgoing push() operration is already registered");
+
+        Ok(())
+    }
+
+    /// Issues a `pop()` operation in an outgoing flow.
+    /// This function fails if the underlying `pop()` operation fails.
+    fn issue_outgoing_pop(&mut self, qd: QDesc) -> Result<()> {
+        let qt: QToken = self.catloop.pop(qd, None)?;
+
+        // It is safe to call except() here, because we just issued the `pop()` operation,
+        // queue tokens are unique, and thus the operation is ensured to not be registered.
+        self.register_outgoing_operation(qd, qt)
+            .expect("outgoing pop() operration is already registered");
+
+        // Set the flag to indicate that this flow has an inflight `pop()` operation.
+        // It is safe to call except() here, because `qd` is ensured to be in the table of queue descriptors.
+        // All queue descriptors are registered when connection is established.
+        let catloop_inflight_pop: &mut bool = self
+            .outgoing_qds
+            .get_mut(&qd)
+            .expect("queue descriptor should be registered");
+        *catloop_inflight_pop = true;
+
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    /// Converts a [sockaddr] into a port number.
+    pub fn sockaddr_to_socketaddrv4(saddr: libc::sockaddr) -> Result<SocketAddr> {
+        // TODO: Change the logic below and rename this function once we support V6 addresses as well.
+        let sin: libc::sockaddr_in = unsafe { mem::transmute(saddr) };
+        if sin.sin_family != libc::AF_INET as u16 {
+            anyhow::bail!("communication domain not supported");
+        };
+        let addr: Ipv4Addr = Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr));
+        let port: u16 = u16::from_be(sin.sin_port);
+        Ok(SocketAddr::new(ipv4_addr, port))
+    }
+
+    #[cfg(target_os = "windows")]
+    /// Converts a [sockaddr] into a port number.
+    pub fn sockaddr_to_socketaddrv4(saddr: SOCKADDR) -> Result<SocketAddr> {
+        // Casting to SOCKADDR_IN
+        let addr_in: SOCKADDR_IN = unsafe { std::mem::transmute(saddr) };
+
+        if addr_in.sin_family != AF_INET_FAM {
+            anyhow::bail!("communication domain not supported");
+        };
+        // Extracting IPv4 address and port
+        let ipv4_addr = unsafe {
+            Ipv4Addr::new(
+                addr_in.sin_addr.S_un.S_un_b.s_b4,
+                addr_in.sin_addr.S_un.S_un_b.s_b3,
+                addr_in.sin_addr.S_un.S_un_b.s_b2,
+                addr_in.sin_addr.S_un.S_un_b.s_b1,
+            )
+        };
+        let port: u16 = u16::from_be(addr_in.sin_port);
+
+        // Creating SocketAddrV4
+        Ok(SocketAddr::new(IpAddr::V4(ipv4_addr), port))
+    }
+
+    fn create_outgoing_socket(&mut self, ip_addr: &SocketAddr) -> Result<QDesc> {
+        // Create outgoing socket.
+        let new_server_socket: QDesc = match self.catloop.socket(AF_INET, SOCK_STREAM, 0) {
+            Ok(qd) => qd,
+            Err(e) => {
+                println!("ERROR: failed to create socket (error={:?})", e);
+                anyhow::bail!("failed to create socket: {:?}", e.cause)
+            },
+        };
+
+        // Connect to remote address.
+        let qt = match self.catloop.connect(new_server_socket, self.remote_addr) {
+            // Operation succeeded, register outgoing operation.
+            Ok(qt) => qt,
+            // Operation failed, close socket.
+            Err(e) => {
+                if let Err(e) = self.catloop.close(new_server_socket) {
+                    // Failed to close socket, log error.
+                    println!("ERROR: close failed (error={:?})", e);
+                    println!("WARN: leaking socket descriptor (sockqd={:?})", new_server_socket);
+                }
+                anyhow::bail!("failed to connect socket: {:?}", e)
+            },
+        };
+
+        // Wait for the accept
+        match self.catloop.wait(qt, Some(Duration::from_secs(120))) {
+            Ok(result) => {
+                if result.qr_opcode != demi_opcode_t::DEMI_OPC_CONNECT {
+                    println!("ERROR: unexpected opcode (opcode={:?})", result.qr_opcode);
+                    anyhow::bail!("unexpected opcode: {:?}", result.qr_opcode)
+                };
+            },
+            Err(e) => {
+                println!("ERROR: failed to wait for accept (error={:?})", e);
+                anyhow::bail!("failed to wait for accept: {:?}", e)
+            },
+        };
+
+        self.outgoing_qds.insert(new_server_socket, false);
+        self.outgoing_qds_map.insert(new_server_socket, ip_addr.clone());
+        self.incoming_client_map
+            .insert(ip_addr.clone(), new_server_socket.clone());
+
+        Ok(new_server_socket)
+    }
+
+    /// Handles the completion of a `pop()` operation on an incoming flow.
+    fn handle_incoming_pop(&mut self, qr: &demi_qresult_t) -> Result<()> {
+        let in_libos_qd: QDesc = qr.qr_qd.into();
+        let incoming_sga: demi_sgarray_t = unsafe { qr.qr_value.sga };
+
+        // Get the incoming address
+        let ip_addr = Self::sockaddr_to_socketaddrv4(unsafe { qr.qr_value.sga.sga_addr })?;
+
+        let catloop_qd_opt: Option<&QDesc> = self.incoming_client_map.get(&ip_addr);
+
+        let catloop_qd: QDesc = match catloop_qd_opt {
+            Some(catloop_qd) => *catloop_qd,
+            None => {
+                // Create outgoing socket.
+                self.create_outgoing_socket(&ip_addr)?
+            },
+        };
+
+        // Push SGA to concerned outgoing flow.
+        let src: *mut libc::c_uchar = incoming_sga.sga_segs[0].sgaseg_buf as *mut libc::c_uchar;
+        let len: usize = incoming_sga.sga_segs[0].sgaseg_len as usize;
+        if let Ok(outgoing_sga) = self.catloop.sgaalloc(len) {
+            // Copy.
+            let dest: *mut libc::c_uchar = outgoing_sga.sga_segs[0].sgaseg_buf as *mut libc::c_uchar;
+            Self::copy(src, dest, len);
+
+            // Issue `push()` operation.
+            if let Err(e) = self.issue_outgoing_push(catloop_qd, &outgoing_sga) {
+                // Failed to issue push operation, log error.
+                println!("ERROR: push failed (error={:?})", e);
+                return Err(e);
+            }
+
+            // Release outgoing SGA.
+            if let Err(e) = self.catloop.sgafree(outgoing_sga) {
+                // Failed to release SGA, log error.
+                println!("ERROR: sgafree failed (error={:?})", e);
+                println!("WARN: leaking outgoing sga");
+                return Err(e.into());
+            }
+        }
+
+        // Release incoming SGA.
+        if let Err(e) = self.in_libos.sgafree(incoming_sga) {
+            // Failed to release SGA, log error.
+            println!("ERROR: sgafree failed (error={:?})", e);
+            println!("WARN: leaking incoming sga");
+            return Err(e.into());
+        }
+
+        // Pop more data from incoming flow.
+        if let Err(e) = self.issue_incoming_pop(in_libos_qd) {
+            // Failed to issue pop operation, log error.
+            println!("ERROR: pop failed (error={:?})", e);
+            return Err(e);
+        }
+        return Ok(());
+    }
+
+    /// Handles the completion of a `pop()` operation on an outgoing flow.
+    fn handle_outgoing_pop(&mut self, qr: &demi_qresult_t) -> Result<()> {
+        let outgoing_sga: demi_sgarray_t = unsafe { qr.qr_value.sga };
+        let catloop_qd: QDesc = qr.qr_qd.into();
+
+        // Check if server aborted connection.
+        if outgoing_sga.sga_segs[0].sgaseg_len == 0 {
+            unimplemented!("server aborted connection");
+        }
+
+        // Push SGA to concerned incoming flow.
+        let src: *mut libc::c_uchar = outgoing_sga.sga_segs[0].sgaseg_buf as *mut libc::c_uchar;
+        let len: usize = outgoing_sga.sga_segs[0].sgaseg_len as usize;
+        if let Ok(incoming_sga) = self.in_libos.sgaalloc(len) {
+            // Copy.
+            let dest: *mut libc::c_uchar = incoming_sga.sga_segs[0].sgaseg_buf as *mut libc::c_uchar;
+            Self::copy(src, dest, len);
+
+            // Issue `push()` operation.
+            if let Err(e) = self.issue_incoming_pushto(catloop_qd, &incoming_sga) {
+                // Failed to issue push operation, log error.
+                println!("ERROR: push failed (error={:?})", e);
+                return Err(e);
+            }
+
+            // Release incoming SGA.
+            if let Err(e) = self.in_libos.sgafree(incoming_sga) {
+                // Failed to release SGA, log error.
+                println!("ERROR: sgafree failed (error={:?})", e);
+                println!("WARN: leaking incoming sga");
+                return Err(e.into());
+            }
+        }
+
+        // Release outgoing SGA.
+        if let Err(e) = self.catloop.sgafree(outgoing_sga) {
+            // Failed to release SGA, log error.
+            println!("ERROR: sgafree failed (error={:?})", e);
+            println!("WARN: leaking outgoing sga");
+            return Err(e.into());
+        }
+
+        // Pop data from outgoing flow.
+        if let Err(e) = self.issue_outgoing_pop(catloop_qd) {
+            // Failed to issue pop operation, log error.
+            println!("ERROR: pop failed (error={:?})", e);
+            return Err(e);
+        }
+
+        return Ok(());
+    }
+
+    /// Handles the completion of a `pushto()` operation on an incoming flow.
+    /// This will issue a pop operation on the incoming connection, if none is inflight.
+    fn handle_incoming_push(&mut self) -> Result<()> {
+        Ok(())
+    }
+
+    /// Handles the completion of a `push()` operation on an outgoing flow.
+    /// This will issue a pop operation on the outgoing connection, if none is inflight.
+    fn handle_outgoing_push(&mut self, qr: &demi_qresult_t) -> Result<()> {
+        // Extract queue descriptor of outgoing connection.
+        let outgoing_qd: QDesc = qr.qr_qd.into();
+
+        // It is safe to call except() here, because `outgoing_qd` is ensured to be in the table of queue descriptors.
+        // All queue descriptors are registered when connection is established.
+        let has_inflight_pop: bool = self
+            .outgoing_qds
+            .get_mut(&outgoing_qd)
+            .expect("queue descriptor should be registered")
+            .to_owned();
+
+        // Issue a pop operation if none is inflight.
+        if !has_inflight_pop {
+            println!("INFO: issuing outgoing pop (qd={:?})", outgoing_qd);
+            if let Err(e) = self.issue_outgoing_pop(outgoing_qd) {
+                // Failed to issue pop operation, log error.
+                println!("ERROR: pop failed (error={:?})", e);
+                return Err(e);
+            }
+        }
+        Ok(())
+    }
+
+    /// Polls incoming operations that are pending, with a timeout.
+    ///
+    /// If any pending operation completes when polling, its result value is
+    /// returned. If the timeout expires before an operation completes, or an
+    /// error is encountered, None is returned instead.
+    fn poll_incoming(&mut self, timeout: Option<Duration>) -> Option<demi_qresult_t> {
+        match self.in_libos.wait_any(&self.incoming_qts, timeout) {
+            Ok((idx, qr)) => {
+                self.unregister_incoming_operation(idx);
+                Some(qr)
+            },
+            Err(e) if e.errno == libc::ETIMEDOUT => None,
+            Err(e) => {
+                println!("ERROR: unexpected error while polling incoming queue (error={:?})", e);
+                None
+            },
+        }
+    }
+
+    /// Polls outgoing operations that are pending, with a timeout.
+    ///
+    /// If any pending operation completes when polling, its result value is
+    /// returned. If the timeout expires before an operation completes, or an
+    /// error is encountered, None is returned instead.
+    fn poll_outgoing(&mut self, timeout: Option<Duration>) -> Option<demi_qresult_t> {
+        match self.catloop.wait_any(&self.outgoing_qts, timeout) {
+            Ok((idx, qr)) => {
+                self.unregister_outgoing_operation(idx);
+                Some(qr)
+            },
+            Err(e) if e.errno == libc::ETIMEDOUT => None,
+            Err(e) => {
+                println!("ERROR: unexpected error while polling outgoing queue (error={:?})", e);
+                None
+            },
+        }
+    }
+
+    fn unregister_incoming_operation(&mut self, index: usize) {
+        let _: QToken = self.incoming_qts.swap_remove(index);
+    }
+
+    fn unregister_outgoing_operation(&mut self, index: usize) {
+        let _: QToken = self.outgoing_qts.swap_remove(index);
+    }
+
+    /// Copies `len` bytes from `src` to `dest`.
+    fn copy(src: *mut libc::c_uchar, dest: *mut libc::c_uchar, len: usize) {
+        let src: &mut [u8] = unsafe { slice::from_raw_parts_mut(src, len) };
+        let dest: &mut [u8] = unsafe { slice::from_raw_parts_mut(dest, len) };
+        dest.clone_from_slice(src);
+    }
+
+    /// Setups local socket.
+    fn setup_local_socket(in_libos: &mut LibOS, local_addr: SocketAddr) -> Result<QDesc> {
+        // Create local socket.
+        let local_socket: QDesc = match in_libos.socket(AF_INET, SOCK_DGRAM, 0) {
+            Ok(qd) => qd,
+            Err(e) => {
+                println!("ERROR: failed to create socket (error={:?})", e);
+                anyhow::bail!("failed to create socket: {:?}", e.cause)
+            },
+        };
+
+        // Bind socket to local address.
+        if let Err(e) = in_libos.bind(local_socket, local_addr) {
+            // Bind failed, close socket.
+            if let Err(e) = in_libos.close(local_socket) {
+                // Close failed, log error.
+                println!("ERROR: close failed (error={:?})", e);
+                println!("WARN: leaking socket descriptor (sockqd={:?})", local_socket);
+            }
+            anyhow::bail!("bind failed: {:?}", e.cause)
+        };
+
+        Ok(local_socket)
+    }
+
+    /// Handles the completion of an unexpected operation.
+    fn handle_unexpected(&mut self, op_name: &str, qr: &demi_qresult_t) -> Result<()> {
+        let qd: QDesc = qr.qr_qd.into();
+        let qt: QToken = qr.qr_qt.into();
+        println!(
+            "WARN: unexpected {} operation completed, ignoring (qd={:?}, qt={:?})",
+            op_name, qd, qt
+        );
+        Ok(())
+    }
+}
+
+impl Proxy for UdpTcpProxy {
+    fn issue_next_op(&mut self) -> Result<()> {
+        self.issue_incoming_pop(self.local_socket)
+    }
+
+    fn non_blocking_poll(
+        &mut self,
+        timeout_incoming: Option<Duration>,
+        timeout_outgoing: Option<Duration>,
+    ) -> Result<()> {
+        // Poll incoming flows.
+        if let Some(qr) = self.poll_incoming(timeout_incoming) {
+            // Parse operation result.
+            match qr.qr_opcode {
+                demi_opcode_t::DEMI_OPC_POP => self.handle_incoming_pop(&qr)?,
+                demi_opcode_t::DEMI_OPC_PUSH => self.handle_incoming_push()?,
+                demi_opcode_t::DEMI_OPC_FAILED => {
+                    println!("ERROR: incoming operation failed (error={:?})", qr.qr_ret);
+                    if let Err(e) = self.issue_incoming_pop(self.local_socket) {
+                        println!("ERROR: failed to issue incoming pop (error={:?})", e);
+                    }
+                    anyhow::bail!("operation failed")
+                },
+                demi_opcode_t::DEMI_OPC_ACCEPT => self.handle_unexpected("incoming_accept", &qr)?,
+                demi_opcode_t::DEMI_OPC_INVALID => self.handle_unexpected("incoming_invalid", &qr)?,
+                demi_opcode_t::DEMI_OPC_CLOSE => self.handle_unexpected("incoming_close", &qr)?,
+                demi_opcode_t::DEMI_OPC_CONNECT => self.handle_unexpected("incoming_connect", &qr)?,
+            };
+        }
+
+        // Poll outgoing flows.
+        if let Some(qr) = self.poll_outgoing(timeout_outgoing) {
+            // Parse operation result.
+            match qr.qr_opcode {
+                demi_opcode_t::DEMI_OPC_POP => self.handle_outgoing_pop(&qr)?,
+                demi_opcode_t::DEMI_OPC_PUSH => self.handle_outgoing_push(&qr)?,
+                demi_opcode_t::DEMI_OPC_FAILED => {
+                    println!("ERROR: outgoing operation failed (error={:?})", qr.qr_ret);
+                    let catloop_qd: QDesc = qr.qr_qd.into();
+                    if let Err(e) = self.issue_outgoing_pop(catloop_qd) {
+                        println!("ERROR: failed to issue outgoing pop (error={:?})", e);
+                    }
+                    anyhow::bail!("operation failed")
+                },
+                demi_opcode_t::DEMI_OPC_ACCEPT => self.handle_unexpected("outgoing_accept", &qr)?,
+                demi_opcode_t::DEMI_OPC_INVALID => self.handle_unexpected("outgoing_invalid", &qr)?,
+                demi_opcode_t::DEMI_OPC_CLOSE => self.handle_unexpected("outgoing_close", &qr)?,
+                demi_opcode_t::DEMI_OPC_CONNECT => self.handle_unexpected("outgoing_connect", &qr)?,
+            };
+        }
+
+        Ok(())
+    }
+
+    fn run_eval(&mut self, _eval: EvalRequest) -> Result<()> {
+        // Return not implemented error
+        println!("Error: run_eval not implemented for UdpProxy");
+        Err(anyhow::format_err!("Not implemented"))
+    }
+}
+
 impl NetProxyManager {
     #[allow(dead_code)]
     pub fn new() -> (Self, Receiver<ProxyRequest>) {
@@ -1377,6 +1944,17 @@ impl NetProxyManager {
             },
             ProxyType::Udp => {
                 match UdpProxy::new(
+                    &proxy_req.vm_id,
+                    proxy_req.local_address,
+                    proxy_req.in_libos.clone(),
+                    proxy_req.remote_addr,
+                ) {
+                    Ok(proxy) => Ok(Box::new(proxy)),
+                    Err(e) => Err(e),
+                }
+            },
+            ProxyType::UdpTcp => {
+                match UdpTcpProxy::new(
                     &proxy_req.vm_id,
                     proxy_req.local_address,
                     proxy_req.in_libos.clone(),

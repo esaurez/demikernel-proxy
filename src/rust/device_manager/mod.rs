@@ -156,10 +156,13 @@ impl RegionManager for ShmRegionManager {
                 offset: region.offset,
                 size: region.size,
             }),
-            Err(_) => Err(Fail {
-                errno: 0,
-                cause: "Failed to create region".to_string(),
-            }),
+            Err(_) => {
+                println!("ERROR: failed to get region with name: {}", segment_name);
+                Err(Fail {
+                    errno: 0,
+                    cause: "Failed to get region".to_string(),
+                })
+            },
         }
     }
 
