@@ -25,6 +25,7 @@ proxy = { path = "../rust/proxy" }
 #=======================================================================================================================
 
 [features]
+profiler = ["demikernel/profiler"]
 catnap-libos = [ "demikernel/catnap-libos", "demikernel/catloop-libos" ]
 catnip-libos = [ "demikernel/catnip-libos", "demikernel/catloop-libos" ]
 virtio-shmem = [ "demikernel/virtio-shmem" ]

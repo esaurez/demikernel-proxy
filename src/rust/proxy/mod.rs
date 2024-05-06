@@ -4,6 +4,10 @@
 #![feature(extract_if)]
 #![feature(hash_extract_if)]
 
+pub mod constants;
+mod tcp_in_libos;
+mod udp_in_libos;
+
 //======================================================================================================================
 // Imports
 //======================================================================================================================
@@ -13,6 +17,8 @@ use ::demikernel::pal::linux::virtio_shmem::SharedMemory;
 // This feature is only for windows and nimble-shmem
 #[cfg(all(feature = "nimble-shmem", target_os = "windows"))]
 use ::demikernel::pal::windows::nimble_shm::SharedMemory;
+#[cfg(feature = "profiler")]
+use ::demikernel::perftools::profiler;
 use ::demikernel::{
     demi_sgarray_t,
     demikernel::config::Config,
@@ -20,6 +26,7 @@ use ::demikernel::{
         demi_opcode_t,
         demi_qresult_t,
     },
+    timer,
     LibOS,
     LibOSName,
     QDesc,
@@ -50,33 +57,22 @@ use ::yaml_rust::{
     YamlLoader,
 };
 
-//======================================================================================================================
-// Imports
-//======================================================================================================================
 #[cfg(target_os = "windows")]
 use windows::Win32::Networking::WinSock::SOCKADDR;
-
-#[cfg(target_os = "windows")]
-pub const AF_INET_FAM: windows::Win32::Networking::WinSock::ADDRESS_FAMILY =
-    windows::Win32::Networking::WinSock::AF_INET;
-
-#[cfg(target_os = "windows")]
-pub const AF_INET: i32 = windows::Win32::Networking::WinSock::AF_INET.0 as i32;
-
-#[cfg(target_os = "windows")]
-pub const SOCK_STREAM: i32 = windows::Win32::Networking::WinSock::SOCK_STREAM.0 as i32;
-
-#[cfg(target_os = "windows")]
-pub const SOCK_DGRAM: i32 = windows::Win32::Networking::WinSock::SOCK_DGRAM.0 as i32;
-
 #[cfg(target_os = "windows")]
 use windows::Win32::Networking::WinSock::SOCKADDR_IN;
 
-#[cfg(target_os = "linux")]
-pub const AF_INET: i32 = libc::AF_INET;
+use crate::{
+    tcp_in_libos::IncomingTcpLibos,
+    udp_in_libos::IncomingUdpLibos,
+};
 
-#[cfg(target_os = "linux")]
-pub const SOCK_STREAM: i32 = libc::SOCK_STREAM;
+use crate::constants::{
+    AF_INET,
+    AF_INET_FAM,
+    SOCK_DGRAM,
+    SOCK_STREAM,
+};
 
 #[cfg(target_os = "linux")]
 pub const SOCK_DGRAM: i32 = libc::SOCK_DGRAM;
@@ -98,6 +94,10 @@ pub struct EvalRequest {
     segment_size: u32,
 }
 
+pub struct ProfileRequest {
+    clean: bool,
+}
+
 pub enum ProxyRequest {
     // Add a new proxy
     Add(AddRequest),
@@ -105,6 +105,8 @@ pub enum ProxyRequest {
     Remove(String),
     // Run an evaluation
     RunEval(EvalRequest),
+    // Print profile
+    PrintProfile(ProfileRequest),
 }
 
 pub trait ProxyManager: Send + Sync + Debug {
@@ -124,6 +126,7 @@ pub trait ProxyManager: Send + Sync + Debug {
         iterations: u32,
         segment_size: u32,
     ) -> Result<()>;
+    fn print_profile(&self, clean: bool) -> Result<()>;
 }
 
 pub trait ProxyRun {
@@ -160,24 +163,14 @@ impl Clone for ProxyType {
 }
 
 struct TcpProxy {
-    /// LibOS that handles incoming flow.
-    in_libos: LibOS,
+    // Component that handles incoming flow.
+    in_libos: IncomingTcpLibos,
     /// LibOS that handles outgoing flow.
     catloop: LibOS,
     /// Number of clients that are currently connected.
     nclients: usize,
     /// Remote socket address.
     remote_addr: SocketAddr,
-    /// Socket for accepting incoming connections.
-    local_socket: QDesc,
-    /// Queue descriptors of incoming connections.
-    incoming_qds: HashMap<QDesc, bool>,
-    /// Maps a queue descriptor of an incoming connection to its respective outgoing connection.
-    incoming_qds_map: HashMap<QDesc, QDesc>,
-    /// Incoming operations that are pending.
-    incoming_qts: Vec<QToken>,
-    /// Maps a pending incoming operation to its respective queue descriptor.
-    incoming_qts_map: HashMap<QToken, QDesc>,
     /// Queue descriptors of outgoing connections.
     outgoing_qds: HashMap<QDesc, bool>,
     /// Maps a queue descriptor of an outgoing connection to its respective incoming connection.
@@ -190,7 +183,7 @@ struct TcpProxy {
 
 struct UdpProxy {
     /// LibOS that handles incoming flow.
-    in_libos: LibOS,
+    in_libos: IncomingUdpLibos,
     /// LibOS that handles outgoing flow.   
     catloop: LibOS,
     /// IP address to use for outgoing binding.
@@ -199,12 +192,6 @@ struct UdpProxy {
     outgoing_next_port: u16,
     /// Remote socket address to forward packets to.
     remote_addr: SocketAddr,
-    /// Socket to receive incoming packets.
-    local_socket: QDesc,
-    /// Incoming operations that are pending.
-    incoming_qts: Vec<QToken>,
-    /// Maps an incoming address to its respective outgoing socket
-    incoming_client_map: HashMap<SocketAddr, QDesc>,
     /// Queue descriptors of outgoing sockets.
     outgoing_qds: HashMap<QDesc, bool>,
     /// Maps a queue descriptor of an outgoing socket to its respective incoming address.
@@ -215,18 +202,11 @@ struct UdpProxy {
 
 struct UdpTcpProxy {
     /// LibOS that handles incoming flow.
-    in_libos: LibOS,
+    in_libos: IncomingUdpLibos,
     /// LibOS that handles outgoing flow.   
     catloop: LibOS,
     /// Remote socket address to forward packets to.
     remote_addr: SocketAddr,
-    /// Socket to receive incoming packets.
-    local_socket: QDesc,
-    // UDP for incoming
-    /// Incoming operations that are pending.
-    incoming_qts: Vec<QToken>,
-    /// Maps an incoming address to its respective outgoing socket
-    incoming_client_map: HashMap<SocketAddr, QDesc>,
     // TCP for outgoing
     /// Queue descriptors of outgoing connections.
     outgoing_qds: HashMap<QDesc, bool>,
@@ -247,10 +227,6 @@ pub struct NetProxyManager {
 // Associated Functions
 //======================================================================================================================
 impl TcpProxy {
-    /// Expected length for the array of pending incoming operations.
-    /// It controls the pre-allocated size of the array.
-    /// Change this value accordingly so as to avoid allocations on the datapath.
-    const INCOMING_LENGTH: usize = 1024;
     /// Expected length for the array of pending outgoing operations.
     /// It controls the pre-allocated size of the array.
     /// Change this value accordingly so as to avoid allocations on the datapath.
@@ -259,7 +235,7 @@ impl TcpProxy {
     /// Instantiates a TCP proxy that accepts incoming flows from `local_addr` and forwards them to `remote_addr`.
     pub fn new(vm_id: &str, local_addr: SocketAddr, libos_name: String, remote_addr: SocketAddr) -> Result<Self> {
         // Instantiate LibOS for handling incoming flows.
-        let mut in_libos: LibOS = match LibOS::new(libos_name.into()) {
+        let in_libos: IncomingTcpLibos = match IncomingTcpLibos::new(libos_name.into(), local_addr) {
             Ok(libos) => libos,
             Err(e) => {
                 println!("failed to initialize libos (error={:?})", e);
@@ -293,39 +269,22 @@ catnip:
             },
         };
 
-        // Setup local socket.
-        let local_socket: QDesc = Self::setup_local_socket(&mut in_libos, local_addr)?;
-
         Ok(Self {
             in_libos,
             catloop,
             nclients: 0,
             remote_addr,
-            local_socket,
-            incoming_qts: Vec::with_capacity(Self::INCOMING_LENGTH),
-            incoming_qts_map: HashMap::default(),
             outgoing_qts: Vec::with_capacity(Self::OUTGOING_LENGTH),
             outgoing_qts_map: HashMap::default(),
-            incoming_qds: HashMap::default(),
-            incoming_qds_map: HashMap::default(),
             outgoing_qds: HashMap::default(),
             outgoing_qds_map: (HashMap::default()),
         })
     }
 
-    /// Registers an incoming operation that is waiting for completion (pending).
-    /// This function fails if the operation is already registered in the table of pending incoming operations.
-    fn register_incoming_operation(&mut self, qd: QDesc, qt: QToken) -> Result<()> {
-        if self.incoming_qts_map.insert(qt, qd).is_some() {
-            anyhow::bail!("incoming operation is already registered (qt={:?})", qt);
-        }
-        self.incoming_qts.push(qt);
-        Ok(())
-    }
-
     /// Registers an outgoing operation that is waiting for completion (pending).
     /// This function fails if the operation is already registered in the table of pending outgoing operations.
     fn register_outgoing_operation(&mut self, qd: QDesc, qt: QToken) -> Result<()> {
+        timer!("proxy::register_outgoing");
         if self.outgoing_qts_map.insert(qt, qd).is_some() {
             anyhow::bail!("outgoing operation is already registered (qt={:?})", qt);
         }
@@ -333,44 +292,10 @@ catnip:
         Ok(())
     }
 
-    /// Issues a `push()` operation in an incoming flow.
-    /// This function fails if the underlying `push()` operation fails.
-    fn issue_incoming_push(&mut self, qd: QDesc, sga: &demi_sgarray_t) -> Result<()> {
-        let qt: QToken = self.in_libos.push(qd, &sga)?;
-
-        // It is safe to call except() here, because we just issued the `push()` operation,
-        // queue tokens are unique, and thus the operation is ensured to not be registered.
-        self.register_incoming_operation(qd, qt)
-            .expect("incoming push() operration is already registered");
-
-        Ok(())
-    }
-
-    /// Issues a `pop()` operation in an incoming flow.
-    /// This function fails if the underlying `pop()` operation fails.
-    fn issue_incoming_pop(&mut self, qd: QDesc) -> Result<()> {
-        let qt: QToken = self.in_libos.pop(qd, None)?;
-
-        // It is safe to call except() here, because we just issued the `pop()` operation,
-        // queue tokens are unique, and thus the operation is ensured to not be registered.
-        self.register_incoming_operation(qd, qt)
-            .expect("incoming pop() operration is already registered");
-
-        // Set the flag to indicate that this flow has an inflight `pop()` operation.
-        // It is safe to call except() here, because `qd` is ensured to be in the table of queue descriptors.
-        // All queue descriptors are registered when connection is established.
-        let in_libos_inflight_pop: &mut bool = self
-            .incoming_qds
-            .get_mut(&qd)
-            .expect("queue descriptor should be registered");
-        *in_libos_inflight_pop = true;
-
-        Ok(())
-    }
-
     /// Issues a `push()` operation in an outgoing flow.
     /// This function fails if the underlying `push()` operation fails.
     fn issue_outgoing_push(&mut self, qd: QDesc, sga: &demi_sgarray_t) -> Result<()> {
+        timer!("proxy::issue_outgoing_push");
         let qt: QToken = self.catloop.push(qd, &sga)?;
 
         // It is safe to call except() here, because we just issued the `push()` operation,
@@ -384,6 +309,7 @@ catnip:
     /// Issues a `pop()` operation in an outgoing flow.
     /// This function fails if the underlying `pop()` operation fails.
     fn issue_outgoing_pop(&mut self, qd: QDesc) -> Result<()> {
+        timer!("proxy::issue_outgoing_pop");
         let qt: QToken = self.catloop.pop(qd, None)?;
 
         // It is safe to call except() here, because we just issued the `pop()` operation,
@@ -406,6 +332,7 @@ catnip:
     /// Handles the completion of an `accept()` operation.
     /// This function fails if we we fail to setup a connection with the remote address.
     fn handle_incoming_accept(&mut self, qr: &demi_qresult_t) -> Result<()> {
+        timer!("proxy::handle_incoming_accept");
         let new_client_socket: QDesc = unsafe { qr.qr_value.ares.qd.into() };
 
         // Setup remote connection.
@@ -433,14 +360,13 @@ catnip:
         };
 
         // Accept another connection.
-        if let Err(e) = self.issue_accept() {
+        if let Err(e) = self.in_libos.issue_accept() {
             // Failed to issue accept operation, log error.
             println!("ERROR: accept failed (error={:?})", e);
             return Err(e);
         };
 
-        self.incoming_qds.insert(new_client_socket, false);
-        self.incoming_qds_map.insert(new_server_socket, new_client_socket);
+        self.in_libos.insert_qds(new_server_socket, new_client_socket);
         self.outgoing_qds.insert(new_server_socket, false);
         self.outgoing_qds_map.insert(new_client_socket, new_server_socket);
 
@@ -449,17 +375,12 @@ catnip:
 
     /// Handles the completion of a `connect()` operation.
     fn handle_outgoing_connect(&mut self, qr: &demi_qresult_t) {
+        timer!("proxy::handle_outgoing_connect");
         let catloop_qd: QDesc = qr.qr_qd.into();
 
-        // It is safe to call except() here, because `catloop_qd` is ensured to be in the table of queue descriptors.
-        // All queue descriptors are registered when connection is established.
-        let in_libos_qd: QDesc = *self
-            .incoming_qds_map
-            .get(&catloop_qd)
-            .expect("queue descriptor should be registered");
-
+        let in_libos_qd = self.in_libos.get_incoming_qd(catloop_qd);
         // Issue a `pop()` operation in the outgoing flow.
-        if let Err(e) = self.issue_incoming_pop(in_libos_qd) {
+        if let Err(e) = self.in_libos.issue_incoming_pop(in_libos_qd) {
             // Failed to issue pop operation, log error.
             println!("ERROR: pop failed (error={:?})", e);
         }
@@ -470,6 +391,7 @@ catnip:
 
     /// Handles the completion of a `pop()` operation on an incoming flow.
     fn handle_incoming_pop(&mut self, qr: &demi_qresult_t) {
+        timer!("proxy::handle_incoming_pop");
         let incoming_sga: demi_sgarray_t = unsafe { qr.qr_value.sga };
         let in_libos_qd: QDesc = qr.qr_qd.into();
 
@@ -491,6 +413,7 @@ catnip:
         let src: *mut libc::c_uchar = incoming_sga.sga_segs[0].sgaseg_buf as *mut libc::c_uchar;
         let len: usize = incoming_sga.sga_segs[0].sgaseg_len as usize;
         if let Ok(outgoing_sga) = self.catloop.sgaalloc(len) {
+            timer!("proxy::handle_incoming_pop::processing");
             // Copy.
             let dest: *mut libc::c_uchar = outgoing_sga.sga_segs[0].sgaseg_buf as *mut libc::c_uchar;
             Self::copy(src, dest, len);
@@ -517,7 +440,7 @@ catnip:
         }
 
         // Pop more data from incoming flow.
-        if let Err(e) = self.issue_incoming_pop(in_libos_qd) {
+        if let Err(e) = self.in_libos.issue_incoming_pop(in_libos_qd) {
             // Failed to issue pop operation, log error.
             println!("ERROR: pop failed (error={:?})", e);
         }
@@ -525,15 +448,11 @@ catnip:
 
     /// Handles the completion of a `pop()` operation on an outgoing flow.
     fn handle_outgoing_pop(&mut self, qr: &demi_qresult_t) {
+        timer!("proxy::handle_outgoing_pop");
         let outgoing_sga: demi_sgarray_t = unsafe { qr.qr_value.sga };
         let catloop_qd: QDesc = qr.qr_qd.into();
 
-        // It is safe to call except() here, because `catloop_qd` is ensured to be in the table of queue descriptors.
-        // All queue descriptors are registered when connection is established.
-        let in_libos_qd: QDesc = *self
-            .incoming_qds_map
-            .get(&catloop_qd)
-            .expect("queue descriptor should be registered");
+        let in_libos_qd = self.in_libos.get_incoming_qd(catloop_qd);
 
         // Check if server aborted connection.
         if outgoing_sga.sga_segs[0].sgaseg_len == 0 {
@@ -544,12 +463,13 @@ catnip:
         let src: *mut libc::c_uchar = outgoing_sga.sga_segs[0].sgaseg_buf as *mut libc::c_uchar;
         let len: usize = outgoing_sga.sga_segs[0].sgaseg_len as usize;
         if let Ok(incoming_sga) = self.in_libos.sgaalloc(len) {
+            timer!("proxy::handle_outgoing_pop::processing");
             // Copy.
             let dest: *mut libc::c_uchar = incoming_sga.sga_segs[0].sgaseg_buf as *mut libc::c_uchar;
             Self::copy(src, dest, len);
 
             // Issue `push()` operation.
-            if let Err(e) = self.issue_incoming_push(in_libos_qd, &incoming_sga) {
+            if let Err(e) = self.in_libos.issue_incoming_push(in_libos_qd, &incoming_sga) {
                 // Failed to issue push operation, log error.
                 println!("ERROR: push failed (error={:?})", e);
             }
@@ -576,29 +496,10 @@ catnip:
         }
     }
 
-    /// Handles the completion of a `push()` operation on an incoming flow.
-    /// This will issue a pop operation on the incoming connection, if none is inflight.
-    fn handle_incoming_push(&mut self, qr: &demi_qresult_t) {
-        // Extract queue descriptor of incoming connection.
-        let incoming_qd: QDesc = qr.qr_qd.into();
-
-        // It is safe to call except() here, because `incoming_qd` is ensured to be in the table of queue descriptors.
-        // All queue descriptors are registered when connection is established.
-        let has_inflight_pop: bool = self
-            .incoming_qds
-            .get_mut(&incoming_qd)
-            .expect("queue descriptor should be registered")
-            .to_owned();
-
-        // Issue a pop operation if none is inflight.
-        if !has_inflight_pop {
-            unreachable!("should have an incoming pop, but it hasn't (qd={:?})", incoming_qd);
-        }
-    }
-
     /// Handles the completion of a `push()` operation on an outgoing flow.
     /// This will issue a pop operation on the outgoing connection, if none is inflight.
     fn handle_outgoing_push(&mut self, qr: &demi_qresult_t) {
+        timer!("proxy::handle_outgoing_push");
         // Extract queue descriptor of outgoing connection.
         let outgoing_qd: QDesc = qr.qr_qd.into();
 
@@ -624,14 +525,7 @@ catnip:
     fn close_client(&mut self, in_libos_socket: QDesc, catloop_socket: QDesc) {
         match self.in_libos.close(in_libos_socket) {
             Ok(_) => {
-                println!("handle cancellation of tokens (in_libos_socket={:?})", in_libos_socket);
-                self.incoming_qds.remove(&in_libos_socket).unwrap();
                 self.outgoing_qds_map.remove(&in_libos_socket).unwrap();
-                let qts_drained: HashMap<QToken, QDesc> = self
-                    .incoming_qts_map
-                    .extract_if(|_k, v| v == &in_libos_socket)
-                    .collect();
-                let _: Vec<_> = self.incoming_qts.extract_if(|x| qts_drained.contains_key(x)).collect();
             },
             Err(e) => println!("ERROR: failed to close socket (error={:?})", e),
         }
@@ -640,7 +534,7 @@ catnip:
             Ok(_) => {
                 println!("handle cancellation of tokens (catloop_socket={:?})", catloop_socket);
                 self.outgoing_qds.remove(&catloop_socket).unwrap();
-                self.incoming_qds_map.remove(&catloop_socket).unwrap();
+                self.in_libos.remove_qds_map(&catloop_socket).unwrap();
                 let qts_drained: HashMap<QToken, QDesc> =
                     self.outgoing_qts_map.extract_if(|_k, v| v == &catloop_socket).collect();
                 let _: Vec<_> = self.outgoing_qts.extract_if(|x| qts_drained.contains_key(x)).collect();
@@ -650,31 +544,13 @@ catnip:
         self.nclients -= 1;
     }
 
-    /// Polls incoming operations that are pending, with a timeout.
-    ///
-    /// If any pending operation completes when polling, its result value is
-    /// returned. If the timeout expires before an operation completes, or an
-    /// error is encountered, None is returned instead.
-    fn poll_incoming(&mut self, timeout: Option<Duration>) -> Option<demi_qresult_t> {
-        match self.in_libos.wait_any(&self.incoming_qts, timeout) {
-            Ok((idx, qr)) => {
-                self.unregister_incoming_operation(idx);
-                Some(qr)
-            },
-            Err(e) if e.errno == libc::ETIMEDOUT => None,
-            Err(e) => {
-                println!("ERROR: unexpected error while polling incoming queue (error={:?})", e);
-                None
-            },
-        }
-    }
-
     /// Polls outgoing operations that are pending, with a timeout.
     ///
     /// If any pending operation completes when polling, its result value is
     /// returned. If the timeout expires before an operation completes, or an
     /// error is encountered, None is returned instead.
     fn poll_outgoing(&mut self, timeout: Option<Duration>) -> Option<demi_qresult_t> {
+        timer!("proxy::poll_outgoing");
         match self.catloop.wait_any(&self.outgoing_qts, timeout) {
             Ok((idx, qr)) => {
                 self.unregister_outgoing_operation(idx);
@@ -688,15 +564,6 @@ catnip:
         }
     }
 
-    fn unregister_incoming_operation(&mut self, index: usize) {
-        let qt: QToken = self.incoming_qts.remove(index);
-        // It is safe to call except() here, because `qt` is ensured to be in the table of pending operations.
-        // All queue tokens are registered in the table of pending operations when they are issued.
-        self.incoming_qts_map
-            .remove(&qt)
-            .expect("queue token should be registered");
-    }
-
     fn unregister_outgoing_operation(&mut self, index: usize) {
         let qt: QToken = self.outgoing_qts.remove(index);
         // It is safe to call except() here, because `qt` is ensured to be in the table of pending operations.
@@ -708,59 +575,16 @@ catnip:
 
     /// Copies `len` bytes from `src` to `dest`.
     fn copy(src: *mut libc::c_uchar, dest: *mut libc::c_uchar, len: usize) {
+        timer!("proxy::copy");
         let src: &mut [u8] = unsafe { slice::from_raw_parts_mut(src, len) };
         let dest: &mut [u8] = unsafe { slice::from_raw_parts_mut(dest, len) };
         dest.clone_from_slice(src);
-    }
-
-    /// Setups local socket.
-    fn setup_local_socket(in_libos: &mut LibOS, local_addr: SocketAddr) -> Result<QDesc> {
-        // Create local socket.
-        let local_socket: QDesc = match in_libos.socket(AF_INET, SOCK_STREAM, 0) {
-            Ok(qd) => qd,
-            Err(e) => {
-                println!("ERROR: failed to create socket (error={:?})", e);
-                anyhow::bail!("failed to create socket: {:?}", e.cause)
-            },
-        };
-
-        // Bind socket to local address.
-        if let Err(e) = in_libos.bind(local_socket, local_addr) {
-            // Bind failed, close socket.
-            if let Err(e) = in_libos.close(local_socket) {
-                // Close failed, log error.
-                println!("ERROR: close failed (error={:?})", e);
-                println!("WARN: leaking socket descriptor (sockqd={:?})", local_socket);
-            }
-            anyhow::bail!("bind failed: {:?}", e.cause)
-        };
-
-        // Enable socket to accept incoming connections.
-        if let Err(e) = in_libos.listen(local_socket, 16) {
-            // Listen failed, close socket.
-            if let Err(e) = in_libos.close(local_socket) {
-                // Close failed, log error.
-                println!("ERROR: close failed (error={:?})", e);
-                println!("WARN: leaking socket descriptor (sockqd={:?})", local_socket);
-            }
-            anyhow::bail!("listen failed: {:?}", e.cause)
-        }
-
-        Ok(local_socket)
-    }
-
-    /// Issues an `accept()`operation.
-    /// This function fails if the underlying `accept()` operation fails.
-    fn issue_accept(&mut self) -> Result<()> {
-        let qt: QToken = self.in_libos.accept(self.local_socket)?;
-        self.register_incoming_operation(self.local_socket, qt)?;
-        Ok(())
     }
 }
 
 impl Proxy for TcpProxy {
     fn issue_next_op(&mut self) -> Result<()> {
-        self.issue_accept()
+        self.in_libos.issue_accept()
     }
 
     fn non_blocking_poll(
@@ -768,13 +592,15 @@ impl Proxy for TcpProxy {
         timeout_incoming: Option<Duration>,
         timeout_outgoing: Option<Duration>,
     ) -> Result<()> {
+        timer!("proxy::non_blocking_poll");
         // Poll incoming flows.
-        if let Some(qr) = self.poll_incoming(timeout_incoming) {
+        if let Some(qr) = self.in_libos.poll_incoming(timeout_incoming) {
+            timer!("proxy::non_blocking_poll::incoming");
             // Parse operation result.
             match qr.qr_opcode {
                 demi_opcode_t::DEMI_OPC_ACCEPT => self.handle_incoming_accept(&qr)?,
                 demi_opcode_t::DEMI_OPC_POP => self.handle_incoming_pop(&qr),
-                demi_opcode_t::DEMI_OPC_PUSH => self.handle_incoming_push(&qr),
+                demi_opcode_t::DEMI_OPC_PUSH => self.in_libos.handle_incoming_push(&qr),
                 demi_opcode_t::DEMI_OPC_FAILED => {
                     // Check if this is an unrecoverable error.
                     if qr.qr_ret != libc::ECONNRESET as i64 {
@@ -796,6 +622,7 @@ impl Proxy for TcpProxy {
 
         // Poll outgoing flows.
         if let Some(qr) = self.poll_outgoing(timeout_outgoing) {
+            timer!("proxy::non_blocking_poll::outgoing");
             // Parse operation result.
             match qr.qr_opcode {
                 demi_opcode_t::DEMI_OPC_CONNECT => self.handle_outgoing_connect(&qr),
@@ -808,12 +635,7 @@ impl Proxy for TcpProxy {
                     }
                     println!("WARN: server reset connection");
                     let catloop_socket: QDesc = qr.qr_qd.into();
-                    // It is safe to expect() here because the queue descriptor must have been registered.
-                    // All queue descriptors are registered when the connection is established.
-                    let in_libos_socket: QDesc = *self
-                        .incoming_qds_map
-                        .get(&catloop_socket)
-                        .expect("queue descriptor not registered");
+                    let in_libos_socket: QDesc = self.in_libos.get_incoming_qd(catloop_socket);
                     self.close_client(in_libos_socket, catloop_socket);
                 },
                 _ => unreachable!(),
@@ -881,10 +703,6 @@ impl Proxy for TcpProxy {
 }
 
 impl UdpProxy {
-    /// Expected length for the array of pending incoming operations.
-    /// It controls the pre-allocated size of the array.
-    /// Change this value accordingly so as to avoid allocations on the datapath.
-    const INCOMING_LENGTH: usize = 1024;
     /// Expected length for the array of pending outgoing operations.
     /// It controls the pre-allocated size of the array.
     /// Change this value accordingly so as to avoid allocations on the datapath.
@@ -893,7 +711,7 @@ impl UdpProxy {
     /// Instantiates a TCP proxy that accepts incoming flows from `local_addr` and forwards them to `remote_addr`.
     pub fn new(vm_id: &str, local_addr: SocketAddr, libos_name: String, remote_addr: SocketAddr) -> Result<Self> {
         // Instantiate LibOS for handling incoming flows.
-        let mut in_libos: LibOS = match LibOS::new(libos_name.into()) {
+        let in_libos: IncomingUdpLibos = match IncomingUdpLibos::new(libos_name.into(), local_addr) {
             Ok(libos) => libos,
             Err(e) => {
                 println!("failed to initialize libos (error={:?})", e);
@@ -927,9 +745,6 @@ catnip:
             },
         };
 
-        // Setup local socket.
-        let local_socket: QDesc = Self::setup_local_socket(&mut in_libos, local_addr)?;
-
         //\TODO update outgoing_ip and outgoing_next_port
         Ok(Self {
             in_libos,
@@ -937,53 +752,16 @@ catnip:
             remote_addr,
             outgoing_ip: Ipv4Addr::new(127, 0, 0, 1),
             outgoing_next_port: 20000,
-            local_socket,
-            incoming_qts: Vec::with_capacity(Self::INCOMING_LENGTH),
-            incoming_client_map: HashMap::default(),
             outgoing_qds: HashMap::default(),
             outgoing_qds_map: (HashMap::default()),
             outgoing_qts: Vec::with_capacity(Self::OUTGOING_LENGTH),
         })
     }
 
-    /// Registers an incoming operation that is waiting for completion (pending).
-    fn register_incoming_operation(&mut self, qt: QToken) {
-        self.incoming_qts.push(qt);
-    }
-
     /// Registers an outgoing operation that is waiting for completion (pending).
     /// This function fails if the operation is already registered in the table of pending outgoing operations.
     fn register_outgoing_operation(&mut self, qt: QToken) {
         self.outgoing_qts.push(qt);
-    }
-
-    /// Issues a `pushto()` operation in an incoming flow.
-    /// This function fails if the underlying `push()` operation fails.
-    fn issue_incoming_pushto(&mut self, qd: QDesc, sga: &demi_sgarray_t) -> Result<()> {
-        let address = match self.outgoing_qds_map.get(&qd) {
-            Some(address) => address,
-            None => {
-                return Err(anyhow::format_err!("No address found for incoming push"));
-            },
-        };
-        let qt: QToken = self.in_libos.pushto(qd, &sga, *address)?;
-
-        // It is safe to call except() here, because we just issued the `push()` operation,
-        // queue tokens are unique, and thus the operation is ensured to not be registered.
-        self.register_incoming_operation(qt);
-
-        Ok(())
-    }
-
-    /// Issues a `pop()` operation in an incoming flow.
-    /// This function fails if the underlying `pop()` operation fails.
-    fn issue_incoming_pop(&mut self, qd: QDesc) -> Result<()> {
-        let qt: QToken = self.in_libos.pop(qd, None)?;
-
-        // It is safe to call except() here, because we just issued the `pop()` operation,
-        // queue tokens are unique, and thus the operation is ensured to not be registered.
-        self.register_incoming_operation(qt);
-        Ok(())
     }
 
     /// Issues a `push()` operation in an outgoing flow.
@@ -1090,20 +868,19 @@ catnip:
 
         self.outgoing_qds.insert(catloop_qd.clone(), false);
         self.outgoing_qds_map.insert(catloop_qd.clone(), ip_addr.clone());
-        self.incoming_client_map.insert(ip_addr.clone(), catloop_qd.clone());
+        self.in_libos.insert_incoming_map(ip_addr.clone(), catloop_qd.clone());
 
         Ok(catloop_qd)
     }
 
     /// Handles the completion of a `pop()` operation on an incoming flow.
     fn handle_incoming_pop(&mut self, qr: &demi_qresult_t) -> Result<()> {
-        let in_libos_qd: QDesc = qr.qr_qd.into();
         let incoming_sga: demi_sgarray_t = unsafe { qr.qr_value.sga };
 
         // Get the incoming address
         let ip_addr = Self::sockaddr_to_socketaddrv4(unsafe { qr.qr_value.sga.sga_addr })?;
 
-        let catloop_qd_opt: Option<&QDesc> = self.incoming_client_map.get(&ip_addr);
+        let catloop_qd_opt: Option<&QDesc> = self.in_libos.get_incoming_map(&ip_addr);
 
         let catloop_qd: QDesc = match catloop_qd_opt {
             Some(catloop_qd) => *catloop_qd,
@@ -1146,7 +923,7 @@ catnip:
         }
 
         // Pop more data from incoming flow.
-        if let Err(e) = self.issue_incoming_pop(in_libos_qd) {
+        if let Err(e) = self.in_libos.issue_incoming_pop() {
             // Failed to issue pop operation, log error.
             println!("ERROR: pop failed (error={:?})", e);
             return Err(e);
@@ -1166,8 +943,18 @@ catnip:
             let dest: *mut libc::c_uchar = incoming_sga.sga_segs[0].sgaseg_buf as *mut libc::c_uchar;
             Self::copy(src, dest, len);
 
+            let client_address: &SocketAddr = match self.outgoing_qds_map.get(&catloop_qd) {
+                Some(address) => address,
+                None => {
+                    return Err(anyhow::format_err!("No address found for incoming push"));
+                },
+            };
+
             // Issue `push()` operation.
-            if let Err(e) = self.issue_incoming_pushto(catloop_qd, &incoming_sga) {
+            if let Err(e) = self
+                .in_libos
+                .issue_incoming_pushto(catloop_qd, &incoming_sga, *client_address)
+            {
                 // Failed to issue push operation, log error.
                 println!("ERROR: push failed (error={:?})", e);
                 return Err(e);
@@ -1203,7 +990,7 @@ catnip:
     /// Handles the completion of a `pushto()` operation on an incoming flow.
     /// This will issue a pop operation on the incoming connection, if none is inflight.
     fn handle_incoming_push(&mut self) -> Result<()> {
-        Ok(())
+        self.in_libos.handle_incoming_push()
     }
 
     /// Handles the completion of a `push()` operation on an outgoing flow.
@@ -1232,25 +1019,6 @@ catnip:
         Ok(())
     }
 
-    /// Polls incoming operations that are pending, with a timeout.
-    ///
-    /// If any pending operation completes when polling, its result value is
-    /// returned. If the timeout expires before an operation completes, or an
-    /// error is encountered, None is returned instead.
-    fn poll_incoming(&mut self, timeout: Option<Duration>) -> Option<demi_qresult_t> {
-        match self.in_libos.wait_any(&self.incoming_qts, timeout) {
-            Ok((idx, qr)) => {
-                self.unregister_incoming_operation(idx);
-                Some(qr)
-            },
-            Err(e) if e.errno == libc::ETIMEDOUT => None,
-            Err(e) => {
-                println!("ERROR: unexpected error while polling incoming queue (error={:?})", e);
-                None
-            },
-        }
-    }
-
     /// Polls outgoing operations that are pending, with a timeout.
     ///
     /// If any pending operation completes when polling, its result value is
@@ -1270,10 +1038,6 @@ catnip:
         }
     }
 
-    fn unregister_incoming_operation(&mut self, index: usize) {
-        let _: QToken = self.incoming_qts.swap_remove(index);
-    }
-
     fn unregister_outgoing_operation(&mut self, index: usize) {
         let _: QToken = self.outgoing_qts.swap_remove(index);
     }
@@ -1283,31 +1047,6 @@ catnip:
         let src: &mut [u8] = unsafe { slice::from_raw_parts_mut(src, len) };
         let dest: &mut [u8] = unsafe { slice::from_raw_parts_mut(dest, len) };
         dest.clone_from_slice(src);
-    }
-
-    /// Setups local socket.
-    fn setup_local_socket(in_libos: &mut LibOS, local_addr: SocketAddr) -> Result<QDesc> {
-        // Create local socket.
-        let local_socket: QDesc = match in_libos.socket(AF_INET, SOCK_DGRAM, 0) {
-            Ok(qd) => qd,
-            Err(e) => {
-                println!("ERROR: failed to create socket (error={:?})", e);
-                anyhow::bail!("failed to create socket: {:?}", e.cause)
-            },
-        };
-
-        // Bind socket to local address.
-        if let Err(e) = in_libos.bind(local_socket, local_addr) {
-            // Bind failed, close socket.
-            if let Err(e) = in_libos.close(local_socket) {
-                // Close failed, log error.
-                println!("ERROR: close failed (error={:?})", e);
-                println!("WARN: leaking socket descriptor (sockqd={:?})", local_socket);
-            }
-            anyhow::bail!("bind failed: {:?}", e.cause)
-        };
-
-        Ok(local_socket)
     }
 
     /// Handles the completion of an unexpected operation.
@@ -1324,7 +1063,7 @@ catnip:
 
 impl Proxy for UdpProxy {
     fn issue_next_op(&mut self) -> Result<()> {
-        self.issue_incoming_pop(self.local_socket)
+        self.in_libos.issue_incoming_pop()
     }
 
     fn non_blocking_poll(
@@ -1333,14 +1072,14 @@ impl Proxy for UdpProxy {
         timeout_outgoing: Option<Duration>,
     ) -> Result<()> {
         // Poll incoming flows.
-        if let Some(qr) = self.poll_incoming(timeout_incoming) {
+        if let Some(qr) = self.in_libos.poll_incoming(timeout_incoming) {
             // Parse operation result.
             match qr.qr_opcode {
                 demi_opcode_t::DEMI_OPC_POP => self.handle_incoming_pop(&qr)?,
                 demi_opcode_t::DEMI_OPC_PUSH => self.handle_incoming_push()?,
                 demi_opcode_t::DEMI_OPC_FAILED => {
                     println!("ERROR: incoming operation failed (error={:?})", qr.qr_ret);
-                    if let Err(e) = self.issue_incoming_pop(self.local_socket) {
+                    if let Err(e) = self.in_libos.issue_incoming_pop() {
                         println!("ERROR: failed to issue incoming pop (error={:?})", e);
                     }
                     anyhow::bail!("operation failed")
@@ -1386,7 +1125,7 @@ impl Proxy for UdpProxy {
 impl Drop for UdpProxy {
     fn drop(&mut self) {
         // Close local socket
-        if let Err(e) = self.in_libos.close(self.local_socket) {
+        if let Err(e) = self.in_libos.close() {
             println!("ERROR: {:?}", e);
         }
 
@@ -1400,10 +1139,6 @@ impl Drop for UdpProxy {
 }
 
 impl UdpTcpProxy {
-    /// Expected length for the array of pending incoming operations.
-    /// It controls the pre-allocated size of the array.
-    /// Change this value accordingly so as to avoid allocations on the datapath.
-    const INCOMING_LENGTH: usize = 1024;
     /// Expected length for the array of pending outgoing operations.
     /// It controls the pre-allocated size of the array.
     /// Change this value accordingly so as to avoid allocations on the datapath.
@@ -1412,7 +1147,7 @@ impl UdpTcpProxy {
     /// Instantiates a TCP proxy that accepts incoming flows from `local_addr` and forwards them to `remote_addr`.
     pub fn new(vm_id: &str, local_addr: SocketAddr, libos_name: String, remote_addr: SocketAddr) -> Result<Self> {
         // Instantiate LibOS for handling incoming flows.
-        let mut in_libos: LibOS = match LibOS::new(libos_name.into()) {
+        let in_libos: IncomingUdpLibos = match IncomingUdpLibos::new(libos_name.into(), local_addr) {
             Ok(libos) => libos,
             Err(e) => {
                 println!("failed to initialize libos (error={:?})", e);
@@ -1446,26 +1181,15 @@ catnip:
             },
         };
 
-        // Setup local socket.
-        let local_socket: QDesc = Self::setup_local_socket(&mut in_libos, local_addr)?;
-
         Ok(Self {
             in_libos,
             catloop,
             remote_addr,
-            local_socket,
-            incoming_qts: Vec::with_capacity(Self::INCOMING_LENGTH),
-            incoming_client_map: HashMap::default(),
             outgoing_qts: Vec::with_capacity(Self::OUTGOING_LENGTH),
             outgoing_qts_map: HashMap::default(),
             outgoing_qds: HashMap::default(),
             outgoing_qds_map: (HashMap::default()),
         })
-    }
-
-    /// Registers an incoming operation that is waiting for completion (pending).
-    fn register_incoming_operation(&mut self, qt: QToken) {
-        self.incoming_qts.push(qt);
     }
 
     /// Registers an outgoing operation that is waiting for completion (pending).
@@ -1475,35 +1199,6 @@ catnip:
             anyhow::bail!("outgoing operation is already registered (qt={:?})", qt);
         }
         self.outgoing_qts.push(qt);
-        Ok(())
-    }
-
-    /// Issues a `pushto()` operation in an incoming flow.
-    /// This function fails if the underlying `push()` operation fails.
-    fn issue_incoming_pushto(&mut self, qd: QDesc, sga: &demi_sgarray_t) -> Result<()> {
-        let address = match self.outgoing_qds_map.get(&qd) {
-            Some(address) => address,
-            None => {
-                return Err(anyhow::format_err!("No address found for incoming push"));
-            },
-        };
-        let qt: QToken = self.in_libos.pushto(qd, &sga, *address)?;
-
-        // It is safe to call except() here, because we just issued the `push()` operation,
-        // queue tokens are unique, and thus the operation is ensured to not be registered.
-        self.register_incoming_operation(qt);
-
-        Ok(())
-    }
-
-    /// Issues a `pop()` operation in an incoming flow.
-    /// This function fails if the underlying `pop()` operation fails.
-    fn issue_incoming_pop(&mut self, qd: QDesc) -> Result<()> {
-        let qt: QToken = self.in_libos.pop(qd, None)?;
-
-        // It is safe to call except() here, because we just issued the `pop()` operation,
-        // queue tokens are unique, and thus the operation is ensured to not be registered.
-        self.register_incoming_operation(qt);
         Ok(())
     }
 
@@ -1620,21 +1315,19 @@ catnip:
 
         self.outgoing_qds.insert(new_server_socket, false);
         self.outgoing_qds_map.insert(new_server_socket, ip_addr.clone());
-        self.incoming_client_map
-            .insert(ip_addr.clone(), new_server_socket.clone());
+        self.in_libos.insert_incoming_map(ip_addr.clone(), new_server_socket);
 
         Ok(new_server_socket)
     }
 
     /// Handles the completion of a `pop()` operation on an incoming flow.
     fn handle_incoming_pop(&mut self, qr: &demi_qresult_t) -> Result<()> {
-        let in_libos_qd: QDesc = qr.qr_qd.into();
         let incoming_sga: demi_sgarray_t = unsafe { qr.qr_value.sga };
 
         // Get the incoming address
         let ip_addr = Self::sockaddr_to_socketaddrv4(unsafe { qr.qr_value.sga.sga_addr })?;
 
-        let catloop_qd_opt: Option<&QDesc> = self.incoming_client_map.get(&ip_addr);
+        let catloop_qd_opt: Option<&QDesc> = self.in_libos.get_incoming_map(&ip_addr);
 
         let catloop_qd: QDesc = match catloop_qd_opt {
             Some(catloop_qd) => *catloop_qd,
@@ -1677,7 +1370,7 @@ catnip:
         }
 
         // Pop more data from incoming flow.
-        if let Err(e) = self.issue_incoming_pop(in_libos_qd) {
+        if let Err(e) = self.in_libos.issue_incoming_pop() {
             // Failed to issue pop operation, log error.
             println!("ERROR: pop failed (error={:?})", e);
             return Err(e);
@@ -1703,8 +1396,18 @@ catnip:
             let dest: *mut libc::c_uchar = incoming_sga.sga_segs[0].sgaseg_buf as *mut libc::c_uchar;
             Self::copy(src, dest, len);
 
+            let client_address = match self.outgoing_qds_map.get(&catloop_qd) {
+                Some(address) => address,
+                None => {
+                    return Err(anyhow::format_err!("No address found for incoming push"));
+                },
+            };
+
             // Issue `push()` operation.
-            if let Err(e) = self.issue_incoming_pushto(catloop_qd, &incoming_sga) {
+            if let Err(e) = self
+                .in_libos
+                .issue_incoming_pushto(catloop_qd, &incoming_sga, *client_address)
+            {
                 // Failed to issue push operation, log error.
                 println!("ERROR: push failed (error={:?})", e);
                 return Err(e);
@@ -1740,7 +1443,7 @@ catnip:
     /// Handles the completion of a `pushto()` operation on an incoming flow.
     /// This will issue a pop operation on the incoming connection, if none is inflight.
     fn handle_incoming_push(&mut self) -> Result<()> {
-        Ok(())
+        self.in_libos.handle_incoming_push()
     }
 
     /// Handles the completion of a `push()` operation on an outgoing flow.
@@ -1769,25 +1472,6 @@ catnip:
         Ok(())
     }
 
-    /// Polls incoming operations that are pending, with a timeout.
-    ///
-    /// If any pending operation completes when polling, its result value is
-    /// returned. If the timeout expires before an operation completes, or an
-    /// error is encountered, None is returned instead.
-    fn poll_incoming(&mut self, timeout: Option<Duration>) -> Option<demi_qresult_t> {
-        match self.in_libos.wait_any(&self.incoming_qts, timeout) {
-            Ok((idx, qr)) => {
-                self.unregister_incoming_operation(idx);
-                Some(qr)
-            },
-            Err(e) if e.errno == libc::ETIMEDOUT => None,
-            Err(e) => {
-                println!("ERROR: unexpected error while polling incoming queue (error={:?})", e);
-                None
-            },
-        }
-    }
-
     /// Polls outgoing operations that are pending, with a timeout.
     ///
     /// If any pending operation completes when polling, its result value is
@@ -1807,10 +1491,6 @@ catnip:
         }
     }
 
-    fn unregister_incoming_operation(&mut self, index: usize) {
-        let _: QToken = self.incoming_qts.swap_remove(index);
-    }
-
     fn unregister_outgoing_operation(&mut self, index: usize) {
         let _: QToken = self.outgoing_qts.swap_remove(index);
     }
@@ -1820,31 +1500,6 @@ catnip:
         let src: &mut [u8] = unsafe { slice::from_raw_parts_mut(src, len) };
         let dest: &mut [u8] = unsafe { slice::from_raw_parts_mut(dest, len) };
         dest.clone_from_slice(src);
-    }
-
-    /// Setups local socket.
-    fn setup_local_socket(in_libos: &mut LibOS, local_addr: SocketAddr) -> Result<QDesc> {
-        // Create local socket.
-        let local_socket: QDesc = match in_libos.socket(AF_INET, SOCK_DGRAM, 0) {
-            Ok(qd) => qd,
-            Err(e) => {
-                println!("ERROR: failed to create socket (error={:?})", e);
-                anyhow::bail!("failed to create socket: {:?}", e.cause)
-            },
-        };
-
-        // Bind socket to local address.
-        if let Err(e) = in_libos.bind(local_socket, local_addr) {
-            // Bind failed, close socket.
-            if let Err(e) = in_libos.close(local_socket) {
-                // Close failed, log error.
-                println!("ERROR: close failed (error={:?})", e);
-                println!("WARN: leaking socket descriptor (sockqd={:?})", local_socket);
-            }
-            anyhow::bail!("bind failed: {:?}", e.cause)
-        };
-
-        Ok(local_socket)
     }
 
     /// Handles the completion of an unexpected operation.
@@ -1861,7 +1516,7 @@ catnip:
 
 impl Proxy for UdpTcpProxy {
     fn issue_next_op(&mut self) -> Result<()> {
-        self.issue_incoming_pop(self.local_socket)
+        self.in_libos.issue_incoming_pop()
     }
 
     fn non_blocking_poll(
@@ -1870,14 +1525,14 @@ impl Proxy for UdpTcpProxy {
         timeout_outgoing: Option<Duration>,
     ) -> Result<()> {
         // Poll incoming flows.
-        if let Some(qr) = self.poll_incoming(timeout_incoming) {
+        if let Some(qr) = self.in_libos.poll_incoming(timeout_incoming) {
             // Parse operation result.
             match qr.qr_opcode {
                 demi_opcode_t::DEMI_OPC_POP => self.handle_incoming_pop(&qr)?,
                 demi_opcode_t::DEMI_OPC_PUSH => self.handle_incoming_push()?,
                 demi_opcode_t::DEMI_OPC_FAILED => {
                     println!("ERROR: incoming operation failed (error={:?})", qr.qr_ret);
-                    if let Err(e) = self.issue_incoming_pop(self.local_socket) {
+                    if let Err(e) = self.in_libos.issue_incoming_pop() {
                         println!("ERROR: failed to issue incoming pop (error={:?})", e);
                     }
                     anyhow::bail!("operation failed")
@@ -1999,6 +1654,7 @@ impl ProxyRun for NetProxyManager {
             }
         }
         loop {
+            timer!("proxy::loop");
             // \TODO: Only poll on active proxies
             for (_, proxy) in proxy_map.iter_mut() {
                 match proxy.non_blocking_poll(timeout_incoming, timeout_outgoing) {
@@ -2014,6 +1670,7 @@ impl ProxyRun for NetProxyManager {
 
             control_counter += 1;
             if control_counter == op_iteration_wait {
+                timer!("proxy::control_op");
                 control_counter = 0;
                 match event_receiver.try_recv() {
                     Ok(request) => {
@@ -2050,6 +1707,16 @@ impl ProxyRun for NetProxyManager {
                                     println!("Error: could not find vm {:?}", &eval_req.vm_id);
                                     continue;
                                 },
+                            },
+                            ProxyRequest::PrintProfile(p) => {
+                                println!("Printing profile");
+                                if p.clean {
+                                    #[cfg(feature = "profiler")]
+                                    profiler::reset();
+                                } else {
+                                    #[cfg(feature = "profiler")]
+                                    profiler::write(&mut std::io::stdout(), None).expect("failed to write to stdout");
+                                }
                             },
                         }
                     },
@@ -2107,6 +1774,12 @@ impl ProxyManager for NetProxyManager {
             iterations,
             segment_size,
         });
+        self.req_send.send(request)?;
+        Ok(())
+    }
+
+    fn print_profile(&self, clean: bool) -> Result<()> {
+        let request: ProxyRequest = ProxyRequest::PrintProfile(ProfileRequest { clean });
         self.req_send.send(request)?;
         Ok(())
     }

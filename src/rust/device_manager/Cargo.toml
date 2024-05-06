@@ -30,6 +30,7 @@ sparse_mmap = { path =  "../../../../hvlite2/support/sparse_mmap" }
 winapi = { version = "0.3.9" }
 
 [features]
+profiler = ["demikernel/profiler"]
 catnap-libos = [ "demikernel/catnap-libos", "demikernel/catloop-libos" ]
 catnip-libos = [ "demikernel/catnip-libos", "demikernel/catloop-libos" ]
 virtio-shmem = [ "demikernel/virtio-shmem" ]

@@ -7,6 +7,7 @@ service NetManager {
     rpc RemoveDeviceEmulator(DeviceEmulatorConfig) returns (ManagerResponse);
     rpc RemoveDeviceNetwork (DeviceNetworkConfig) returns (ManagerResponse);
 		rpc RunEval(EvalConfig) returns (ManagerResponse);
+		rpc PrintProfile(ProfileRequest) returns (ManagerResponse);
 }
 
 message DeviceEmulatorConfig {
@@ -38,4 +39,8 @@ message EvalConfig {
 	uint32 iterations = 3;
 	uint32 data_size = 4;
 	uint32 segment_size = 5;
+}
+
+message ProfileRequest {
+	bool clean = 1;
 }

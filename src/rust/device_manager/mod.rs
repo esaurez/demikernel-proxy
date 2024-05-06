@@ -336,4 +336,19 @@ impl NetManager for ManagerService {
             status: manager_response::Status::Ok as i32,
         }))
     }
+
+    async fn print_profile(
+        &self,
+        request: Request<manager::ProfileRequest>,
+    ) -> Result<Response<manager::ManagerResponse>, Status> {
+        let r = request.into_inner();
+        let profile_result = self.proxy_manager.lock().unwrap().print_profile(r.clean);
+        if let Err(result) = profile_result {
+            eprintln!("PrintProfile failed: {:?}", result);
+            return Err(Status::internal("error printing profile"));
+        }
+        Ok(Response::new(manager::ManagerResponse {
+            status: manager_response::Status::Ok as i32,
+        }))
+    }
 }

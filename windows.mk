@@ -95,6 +95,14 @@ VM_SHM = no
 CARGO_FEATURES = $(CARGO_FEATURES) --features=nimble-shmem
 !endif
 
+!ifndef PROFILER
+PROFILE = no
+!endif
+!if "$(PROFILER)" == "yes"
+CARGO_FEATURES = $(CARGO_FEATURES) --features=profiler
+!endif
+
+
 #=======================================================================================================================
 # Run Parameters
 #=======================================================================================================================
