@@ -5,26 +5,17 @@
 //======================================================================================================================
 use ::anyhow::Result;
 
-#[cfg(feature = "profiler")]
-use ::demikernel::perftools::profiler;
 use ::demikernel::{
     demi_sgarray_t,
-    demikernel::config::Config,
-    runtime::types::{
-        demi_opcode_t,
-        demi_qresult_t,
-    },
+    runtime::types::demi_qresult_t,
     timer,
     LibOS,
-    LibOSName,
     QDesc,
     QToken,
 };
-use demikernel::demikernel::libos;
 
 use ::std::{
     collections::HashMap,
-    slice,
     time::Duration,
 };
 use std::net::SocketAddr;

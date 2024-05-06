@@ -23,8 +23,6 @@ use device_manager::manager::{
 async fn start_eval(client: &mut NetManagerClient<Channel>, args: &Vec<String>) -> Result<()> {
     println!("Starting eval...");
 
-    let args: Vec<String> = env::args().collect();
-
     // Check command line arguments.
     if args.len() < 6 {
         println!(

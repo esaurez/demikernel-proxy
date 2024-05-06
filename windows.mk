@@ -88,12 +88,8 @@ CARGO_FEATURES = $(CARGO_FEATURES) --features=$(DRIVER)
 !endif
 
 # Enable VM Shared Memory
-!ifndef VM_SHM
-VM_SHM = no
-!endif
-!if "$(VM_SHM)" == "yes"
+# Always enabled in windows, as we don't support real shared memory here.
 CARGO_FEATURES = $(CARGO_FEATURES) --features=nimble-shmem
-!endif
 
 !ifndef PROFILER
 PROFILE = no
