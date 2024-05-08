@@ -43,6 +43,7 @@ impl IncomingUdpLibos {
     const INCOMING_LENGTH: usize = 1024;
 
     pub fn new(libos_name: String, local_addr: SocketAddr) -> Result<Self> {
+        timer!("proxy::udp::new");
         // Instantiate LibOS for handling incoming flows.
         let mut in_libos: LibOS = match LibOS::new(libos_name.into()) {
             Ok(libos) => libos,
@@ -75,7 +76,7 @@ impl IncomingUdpLibos {
     /// Issues a `pushto()` operation in an incoming flow.
     /// This function fails if the underlying `push()` operation fails.
     pub fn issue_incoming_pushto(&mut self, qd: QDesc, sga: &demi_sgarray_t, to: SocketAddr) -> Result<()> {
-        timer!("proxy::issue_incoming_push");
+        timer!("proxy::udp::issue_incoming_pushto");
 
         let qt: QToken = self.in_libos.pushto(qd, &sga, to)?;
 
@@ -100,6 +101,7 @@ impl IncomingUdpLibos {
 
     /// Setups local socket.
     fn setup_local_socket(in_libos: &mut LibOS, local_addr: SocketAddr) -> Result<QDesc> {
+        timer!("proxy::udp::setup_local_socket");
         // Create local socket.
         let local_socket: QDesc = match in_libos.socket(AF_INET, SOCK_DGRAM, 0) {
             Ok(qd) => qd,
@@ -125,7 +127,7 @@ impl IncomingUdpLibos {
 
     /// This function fails if the underlying `pop()` operation fails.
     pub fn issue_incoming_pop(&mut self) -> Result<()> {
-        timer!("proxy::issue_incoming_pop");
+        timer!("proxy::udp::issue_incoming_pop");
         let qt: QToken = self.in_libos.pop(self.local_socket, None)?;
 
         // It is safe to call except() here, because we just issued the `pop()` operation,
@@ -140,7 +142,7 @@ impl IncomingUdpLibos {
     /// returned. If the timeout expires before an operation completes, or an
     /// error is encountered, None is returned instead.
     pub fn poll_incoming(&mut self, timeout: Option<Duration>) -> Option<demi_qresult_t> {
-        timer!("proxy::poll_incoming");
+        timer!("proxy::udp::poll_incoming");
         match self.in_libos.wait_any(&self.incoming_qts, timeout) {
             Ok((idx, qr)) => {
                 self.unregister_incoming_operation(idx);
@@ -155,6 +157,7 @@ impl IncomingUdpLibos {
     }
 
     pub fn sgaalloc(&mut self, size: usize) -> Result<demi_sgarray_t> {
+        timer!("proxy::udp::sgaalloc");
         match self.in_libos.sgaalloc(size) {
             Ok(ptr) => Ok(ptr),
             Err(e) => {
@@ -164,6 +167,7 @@ impl IncomingUdpLibos {
     }
 
     pub fn sgafree(&mut self, sga: demi_sgarray_t) -> Result<()> {
+        timer!("proxy::udp::sgafree");
         match self.in_libos.sgafree(sga) {
             Ok(_) => Ok(()),
             Err(e) => {

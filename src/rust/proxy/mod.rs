@@ -1146,6 +1146,7 @@ impl UdpTcpProxy {
 
     /// Instantiates a TCP proxy that accepts incoming flows from `local_addr` and forwards them to `remote_addr`.
     pub fn new(vm_id: &str, local_addr: SocketAddr, libos_name: String, remote_addr: SocketAddr) -> Result<Self> {
+        timer!("proxy::new");
         // Instantiate LibOS for handling incoming flows.
         let in_libos: IncomingUdpLibos = match IncomingUdpLibos::new(libos_name.into(), local_addr) {
             Ok(libos) => libos,
@@ -1205,6 +1206,7 @@ catnip:
     /// Issues a `push()` operation in an outgoing flow.
     /// This function fails if the underlying `push()` operation fails.
     fn issue_outgoing_push(&mut self, qd: QDesc, sga: &demi_sgarray_t) -> Result<()> {
+        timer!("proxy::issue_outgoing_push");
         let qt: QToken = self.catloop.push(qd, &sga)?;
 
         // It is safe to call except() here, because we just issued the `push()` operation,
@@ -1218,6 +1220,7 @@ catnip:
     /// Issues a `pop()` operation in an outgoing flow.
     /// This function fails if the underlying `pop()` operation fails.
     fn issue_outgoing_pop(&mut self, qd: QDesc) -> Result<()> {
+        timer!("proxy::issue_outgoing_pop");
         let qt: QToken = self.catloop.pop(qd, None)?;
 
         // It is safe to call except() here, because we just issued the `pop()` operation,
@@ -1275,6 +1278,7 @@ catnip:
     }
 
     fn create_outgoing_socket(&mut self, ip_addr: &SocketAddr) -> Result<QDesc> {
+        timer!("proxy::create_outgoing_socket");
         // Create outgoing socket.
         let new_server_socket: QDesc = match self.catloop.socket(AF_INET, SOCK_STREAM, 0) {
             Ok(qd) => qd,
@@ -1322,6 +1326,7 @@ catnip:
 
     /// Handles the completion of a `pop()` operation on an incoming flow.
     fn handle_incoming_pop(&mut self, qr: &demi_qresult_t) -> Result<()> {
+        timer!("proxy::handle_incoming_pop");
         let incoming_sga: demi_sgarray_t = unsafe { qr.qr_value.sga };
 
         // Get the incoming address
@@ -1380,6 +1385,7 @@ catnip:
 
     /// Handles the completion of a `pop()` operation on an outgoing flow.
     fn handle_outgoing_pop(&mut self, qr: &demi_qresult_t) -> Result<()> {
+        timer!("proxy::handle_outgoing_pop");
         let outgoing_sga: demi_sgarray_t = unsafe { qr.qr_value.sga };
         let catloop_qd: QDesc = qr.qr_qd.into();
 
@@ -1478,6 +1484,7 @@ catnip:
     /// returned. If the timeout expires before an operation completes, or an
     /// error is encountered, None is returned instead.
     fn poll_outgoing(&mut self, timeout: Option<Duration>) -> Option<demi_qresult_t> {
+        timer!("proxy::poll_outgoing");
         match self.catloop.wait_any(&self.outgoing_qts, timeout) {
             Ok((idx, qr)) => {
                 self.unregister_outgoing_operation(idx);
@@ -1497,6 +1504,7 @@ catnip:
 
     /// Copies `len` bytes from `src` to `dest`.
     fn copy(src: *mut libc::c_uchar, dest: *mut libc::c_uchar, len: usize) {
+        timer!("proxy::copy");
         let src: &mut [u8] = unsafe { slice::from_raw_parts_mut(src, len) };
         let dest: &mut [u8] = unsafe { slice::from_raw_parts_mut(dest, len) };
         dest.clone_from_slice(src);
@@ -1524,6 +1532,7 @@ impl Proxy for UdpTcpProxy {
         timeout_incoming: Option<Duration>,
         timeout_outgoing: Option<Duration>,
     ) -> Result<()> {
+        timer!("proxy::non_blocking_poll");
         // Poll incoming flows.
         if let Some(qr) = self.in_libos.poll_incoming(timeout_incoming) {
             // Parse operation result.
@@ -1654,7 +1663,6 @@ impl ProxyRun for NetProxyManager {
             }
         }
         loop {
-            timer!("proxy::loop");
             // \TODO: Only poll on active proxies
             for (_, proxy) in proxy_map.iter_mut() {
                 match proxy.non_blocking_poll(timeout_incoming, timeout_outgoing) {
