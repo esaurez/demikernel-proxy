@@ -141,6 +141,7 @@ pub trait Proxy {
     ) -> Result<()>;
     fn issue_next_op(&mut self) -> Result<()>;
     fn run_eval(&mut self, eval: EvalRequest) -> Result<()>;
+    fn print_profile(&self, clean: bool) -> Result<()>;
 }
 
 //======================================================================================================================
@@ -179,6 +180,24 @@ struct TcpProxy {
     outgoing_qts: Vec<QToken>,
     /// Maps a pending outgoing operation to its respective queue descriptor.
     outgoing_qts_map: HashMap<QToken, QDesc>,
+
+    clock_drift: u64,
+    nano_per_cycle: f64,
+    // Profile with the following meaning:
+    // 0 -> Rdstc before poll
+    // 1 -> Rdstc after polling incoming
+    // 2 -> Rdstc after incoming sgalloc
+    // 3 -> Rdstc after incoming copy
+    // 4 -> Rdstc after incoming push 
+    // 5 -> Rdstc after incoming handle
+    // 6 -> Rdstc after polling outgoing
+    // 7 -> Rdstc after outgoing sgalloc
+    // 8 -> Rdstc after outgoing copy
+    // 9 -> Rdstc after outgoing push
+    // 10 -> Rdstc after outgoing handle 
+    poll_vec_profile: Vec<([u64; 11])>,
+    current_index: usize,
+    something_happened: bool,
 }
 
 struct UdpProxy {
@@ -278,6 +297,11 @@ catnip:
             outgoing_qts_map: HashMap::default(),
             outgoing_qds: HashMap::default(),
             outgoing_qds_map: (HashMap::default()),
+            clock_drift: constants::clock_drift(),
+            nano_per_cycle: constants::nano_per_cycle(),
+            poll_vec_profile: Vec::with_capacity(20000),
+            current_index: 0,
+            something_happened: false,
         })
     }
 
@@ -391,6 +415,7 @@ catnip:
 
     /// Handles the completion of a `pop()` operation on an incoming flow.
     fn handle_incoming_pop(&mut self, qr: &demi_qresult_t) {
+        let mut current_profile: &mut [u64; 11] = &mut self.poll_vec_profile[self.current_index];
         timer!("proxy::handle_incoming_pop");
         let incoming_sga: demi_sgarray_t = unsafe { qr.qr_value.sga };
         let in_libos_qd: QDesc = qr.qr_qd.into();
@@ -413,16 +438,19 @@ catnip:
         let src: *mut libc::c_uchar = incoming_sga.sga_segs[0].sgaseg_buf as *mut libc::c_uchar;
         let len: usize = incoming_sga.sga_segs[0].sgaseg_len as usize;
         if let Ok(outgoing_sga) = self.catloop.sgaalloc(len) {
+            current_profile[2] = constants::get_current_rdtscp();
             timer!("proxy::handle_incoming_pop::processing");
             // Copy.
             let dest: *mut libc::c_uchar = outgoing_sga.sga_segs[0].sgaseg_buf as *mut libc::c_uchar;
             Self::copy(src, dest, len);
+            current_profile[3] = constants::get_current_rdtscp();
 
             // Issue `push()` operation.
             if let Err(e) = self.issue_outgoing_push(catloop_qd, &outgoing_sga) {
                 // Failed to issue push operation, log error.
                 println!("ERROR: push failed (error={:?})", e);
             }
+            current_profile[4] = constants::get_current_rdtscp();
 
             // Release outgoing SGA.
             if let Err(e) = self.catloop.sgafree(outgoing_sga) {
@@ -448,6 +476,7 @@ catnip:
 
     /// Handles the completion of a `pop()` operation on an outgoing flow.
     fn handle_outgoing_pop(&mut self, qr: &demi_qresult_t) {
+        let mut current_profile: &mut [u64; 11] = &mut self.poll_vec_profile[self.current_index];
         timer!("proxy::handle_outgoing_pop");
         let outgoing_sga: demi_sgarray_t = unsafe { qr.qr_value.sga };
         let catloop_qd: QDesc = qr.qr_qd.into();
@@ -463,16 +492,18 @@ catnip:
         let src: *mut libc::c_uchar = outgoing_sga.sga_segs[0].sgaseg_buf as *mut libc::c_uchar;
         let len: usize = outgoing_sga.sga_segs[0].sgaseg_len as usize;
         if let Ok(incoming_sga) = self.in_libos.sgaalloc(len) {
+            current_profile[7] = constants::get_current_rdtscp();
             timer!("proxy::handle_outgoing_pop::processing");
             // Copy.
             let dest: *mut libc::c_uchar = incoming_sga.sga_segs[0].sgaseg_buf as *mut libc::c_uchar;
             Self::copy(src, dest, len);
-
+            current_profile[8] = constants::get_current_rdtscp();
             // Issue `push()` operation.
             if let Err(e) = self.in_libos.issue_incoming_push(in_libos_qd, &incoming_sga) {
                 // Failed to issue push operation, log error.
                 println!("ERROR: push failed (error={:?})", e);
             }
+            current_profile[9] = constants::get_current_rdtscp();
 
             // Release incoming SGA.
             if let Err(e) = self.in_libos.sgafree(incoming_sga) {
@@ -587,14 +618,52 @@ impl Proxy for TcpProxy {
         self.in_libos.issue_accept()
     }
 
+    fn print_profile(&self, clean: bool) -> Result<()> {
+        if clean {
+            self.poll_vec_profile.clear();
+            self.current_index = 0;
+        } else {
+
+            println!("Drift: {}; Nano per cycle: {};", self.clock_drift, self.nano_per_cycle);
+
+            println!("Rdtsc before poll; Rdtsc after polling incoming; Rdtsc after incoming sgalloc; Rdtsc after incoming copy; Rdtsc after incoming push: {}; Rdtsc after incoming handle: {}, Rdtsc after polling outgoing: {}, Rdtsc after outgoing sgalloc: {}, Rdtsc after outgoing copy: {}, Rdtsc after outgoing push; Rdtsc after outgoing handle");
+           // Iterate from 0 to current_index
+           for i in 0..self.current_index {
+               let current_profile: &[u64; 11] = &self.poll_vec_profile[i];
+               println!(
+                   "{}; {}; {}; {}; {}; {}; {}; {}; {}; {}; {}"
+                   current_profile[0],
+                   current_profile[1],
+                   current_profile[2],
+                   current_profile[3],
+                   current_profile[4],
+                   current_profile[5],
+                   current_profile[6],
+                   current_profile[7],
+                   current_profile[8],
+                   current_profile[9],
+                   current_profile[10]
+               );
+           }
+        }
+
+        Ok(())
+    }
+
     fn non_blocking_poll(
         &mut self,
         timeout_incoming: Option<Duration>,
         timeout_outgoing: Option<Duration>,
     ) -> Result<()> {
+        self.something_happened = false;
+        let current_profile: &mut [u64; 11] = &mut self.poll_vec_profile[self.current_index];
         timer!("proxy::non_blocking_poll");
+
+        current_profile[0] = constants::get_current_rdtsc();
         // Poll incoming flows.
         if let Some(qr) = self.in_libos.poll_incoming(timeout_incoming) {
+            self.something_happened = true;
+            current_profile[1] = constants::get_current_rdtsc();
             timer!("proxy::non_blocking_poll::incoming");
             // Parse operation result.
             match qr.qr_opcode {
@@ -620,8 +689,12 @@ impl Proxy for TcpProxy {
             };
         }
 
+        current_profile[5] = constants::get_current_rdtscp();
+
         // Poll outgoing flows.
         if let Some(qr) = self.poll_outgoing(timeout_outgoing) {
+            self.something_happened = true;
+            current_profile[6] = constants::get_current_rdtsc();
             timer!("proxy::non_blocking_poll::outgoing");
             // Parse operation result.
             match qr.qr_opcode {
@@ -640,6 +713,12 @@ impl Proxy for TcpProxy {
                 },
                 _ => unreachable!(),
             };
+        }
+
+        current_profile[10] = constants::get_current_rdtscp();
+
+        if self.something_happened {
+            self.current_index += 1;
         }
 
         Ok(())
@@ -1064,6 +1143,10 @@ catnip:
 impl Proxy for UdpProxy {
     fn issue_next_op(&mut self) -> Result<()> {
         self.in_libos.issue_incoming_pop()
+    }
+
+    fn print_profile(&self, clean: bool) -> Result<()> {
+        Ok(())
     }
 
     fn non_blocking_poll(
@@ -1527,6 +1610,10 @@ impl Proxy for UdpTcpProxy {
         self.in_libos.issue_incoming_pop()
     }
 
+    fn print_profile(&self, clean: bool) -> Result<()> {
+        Ok(())
+    }
+
     fn non_blocking_poll(
         &mut self,
         timeout_incoming: Option<Duration>,
@@ -1721,9 +1808,16 @@ impl ProxyRun for NetProxyManager {
                                 if p.clean {
                                     #[cfg(feature = "profiler")]
                                     profiler::reset();
+                                    for (_, proxy) in proxy_map.iter_mut() {
+                                        proxy.print_profile(true).unwrap();
+                                    }
                                 } else {
                                     #[cfg(feature = "profiler")]
                                     profiler::write(&mut std::io::stdout(), None).expect("failed to write to stdout");
+
+                                    for (_, proxy) in proxy_map.iter_mut() {
+                                        proxy.print_profile(false).unwrap();
+                                    }
                                 }
                             },
                         }
