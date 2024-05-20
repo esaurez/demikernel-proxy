@@ -194,7 +194,7 @@ struct TcpProxy {
     // 8 -> Rdstc after outgoing copy
     // 9 -> Rdstc after outgoing push
     // 10 -> Rdstc after outgoing handle 
-    poll_vec_profile: Vec<[u64; 11]>,
+    poll_vec_profile: [[u64; 11]; 20000],
     current_index: usize,
     something_happened: bool,
 }
@@ -297,9 +297,9 @@ catnip:
             outgoing_qds: HashMap::default(),
             outgoing_qds_map: (HashMap::default()),
             nano_per_cycle: constants::measure_ns_per_cycle(),
-            poll_vec_profile: Vec::with_capacity(20000),
             current_index: 0,
             something_happened: false,
+            poll_vec_profile: [[0;11]; 20000],
         })
     }
 
@@ -638,7 +638,6 @@ impl Proxy for TcpProxy {
 
     fn print_profile(&mut self, clean: bool) -> Result<()> {
         if clean {
-            self.poll_vec_profile.clear();
             self.current_index = 0;
         } else {
 
@@ -747,10 +746,10 @@ impl Proxy for TcpProxy {
         { // Borrow scope
             let current_profile: &mut [u64; 11] = &mut self.poll_vec_profile[self.current_index];
             current_profile[10] = constants::get_current_rdtscp();
-        }
 
-        if self.something_happened {
-            self.current_index += 1;
+            if self.something_happened || current_profile[10] - current_profile[0] > 100000 {
+                self.current_index += 1;
+            }
         }
 
         Ok(())
