@@ -24,19 +24,19 @@ async fn start_eval(client: &mut NetManagerClient<Channel>, args: &Vec<String>) 
     println!("Starting eval...");
 
     // Check command line arguments.
-    if args.len() < 6 {
+    if args.len() < 7 {
         println!(
-            "Usage: {} vm_id segment_name num_iters data_size segment_size\n",
+            "Usage: {} eval vm_id segment_name num_iters data_size segment_size\n",
             &args[0]
         );
         return Ok(());
     }
 
-    let vm_id: String = args[1].clone();
-    let segment_name: String = args[2].clone();
-    let num_iters: u32 = args[3].parse().unwrap();
-    let data_size: u32 = args[4].parse().unwrap();
-    let segment_size: u32 = args[5].parse().unwrap();
+    let vm_id: String = args[2].clone();
+    let segment_name: String = args[3].clone();
+    let num_iters: u32 = args[4].parse().unwrap();
+    let data_size: u32 = args[5].parse().unwrap();
+    let segment_size: u32 = args[6].parse().unwrap();
 
     let request = tonic::Request::new(EvalConfig {
         vm_id: vm_id.clone(),
