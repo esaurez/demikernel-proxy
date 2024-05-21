@@ -70,7 +70,7 @@ impl IncomingTcpLibos {
     }
 
     pub fn print_profile(&mut self) {
-        self.in_libos.print_profile();
+        //self.in_libos.print_profile();
     }
 
     /// Issues a `push()` operation in an incoming flow.

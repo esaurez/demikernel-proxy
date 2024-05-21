@@ -194,9 +194,10 @@ struct TcpProxy {
     // 8 -> Rdstc after outgoing copy
     // 9 -> Rdstc after outgoing push
     // 10 -> Rdstc after outgoing handle 
-    poll_vec_profile: [[u64; 11]; 20000],
+    poll_vec_profile: [[u64; 12]; 20000],
     current_index: usize,
     something_happened: bool,
+    current_polling_count: u64,
 }
 
 struct UdpProxy {
@@ -299,7 +300,8 @@ demikernel:
             nano_per_cycle: constants::measure_ns_per_cycle(),
             current_index: 0,
             something_happened: false,
-            poll_vec_profile: [[0;11]; 20000],
+            poll_vec_profile: [[0;12]; 20000],
+            current_polling_count: 0,
         })
     }
 
@@ -436,7 +438,7 @@ demikernel:
         let len: usize = incoming_sga.sga_segs[0].sgaseg_len as usize;
         if let Ok(outgoing_sga) = self.catloop.sgaalloc(len) {
             { // Borrow scope
-                let current_profile: &mut [u64; 11] = &mut self.poll_vec_profile[self.current_index];
+                let current_profile: &mut [u64; 12] = &mut self.poll_vec_profile[self.current_index];
                 current_profile[2] = constants::get_current_rdtscp();
             }
             timer!("proxy::handle_incoming_pop::processing");
@@ -444,7 +446,7 @@ demikernel:
             let dest: *mut libc::c_uchar = outgoing_sga.sga_segs[0].sgaseg_buf as *mut libc::c_uchar;
             Self::copy(src, dest, len);
             { // Borrow scope
-                let current_profile: &mut [u64; 11] = &mut self.poll_vec_profile[self.current_index];
+                let current_profile: &mut [u64; 12] = &mut self.poll_vec_profile[self.current_index];
                 current_profile[3] = constants::get_current_rdtscp();
             }
 
@@ -455,7 +457,7 @@ demikernel:
             }
 
             {  // Borrow scope
-                let current_profile: &mut [u64; 11] = &mut self.poll_vec_profile[self.current_index];
+                let current_profile: &mut [u64; 12] = &mut self.poll_vec_profile[self.current_index];
                 current_profile[4] = constants::get_current_rdtscp();
             }
 
@@ -499,7 +501,7 @@ demikernel:
         let len: usize = outgoing_sga.sga_segs[0].sgaseg_len as usize;
         if let Ok(incoming_sga) = self.in_libos.sgaalloc(len) {
             {  // Borrow scope
-                let current_profile: &mut [u64; 11] = &mut self.poll_vec_profile[self.current_index];
+                let current_profile: &mut [u64; 12] = &mut self.poll_vec_profile[self.current_index];
                 current_profile[7] = constants::get_current_rdtscp();
             }
 
@@ -509,7 +511,7 @@ demikernel:
             Self::copy(src, dest, len);
 
             {  // Borrow scope
-                let current_profile: &mut [u64; 11] = &mut self.poll_vec_profile[self.current_index];
+                let current_profile: &mut [u64; 12] = &mut self.poll_vec_profile[self.current_index];
                 current_profile[8] = constants::get_current_rdtscp();
             }
 
@@ -519,7 +521,7 @@ demikernel:
                 println!("ERROR: push failed (error={:?})", e);
             }
             {  // Borrow scope
-                let current_profile: &mut [u64; 11] = &mut self.poll_vec_profile[self.current_index];
+                let current_profile: &mut [u64; 12] = &mut self.poll_vec_profile[self.current_index];
                 current_profile[9] = constants::get_current_rdtscp();
             }
 
@@ -639,17 +641,18 @@ impl Proxy for TcpProxy {
     fn print_profile(&mut self, clean: bool) -> Result<()> {
         if clean {
             self.current_index = 0;
+            self.current_polling_count = 0;
         } else {
 
             println!("Nano per cycle: {};", self.nano_per_cycle);
 
-            println!("Rdtsc before poll; Rdtsc after polling incoming; Rdtsc after incoming sgalloc; Rdtsc after incoming copy; Rdtsc after incoming push; Rdtsc after incoming handle; Rdtsc after polling outgoing; Rdtsc after outgoing sgalloc; Rdtsc after outgoing copy; Rdtsc after outgoing push; Rdtsc after outgoing handle");
+            println!("Rdtsc before poll; Rdtsc after polling incoming; Rdtsc after incoming sgalloc; Rdtsc after incoming copy; Rdtsc after incoming push; Rdtsc after incoming handle; Rdtsc after polling outgoing; Rdtsc after outgoing sgalloc; Rdtsc after outgoing copy; Rdtsc after outgoing push; Rdtsc after outgoing handle; pre-polling count;");
 
            // Iterate from 0 to current_index
            for i in 0..self.current_index {
-               let current_profile: &[u64; 11] = &self.poll_vec_profile[i];
+               let current_profile: &[u64; 12] = &self.poll_vec_profile[i];
                println!(
-                   "{}; {}; {}; {}; {}; {}; {}; {}; {}; {}; {}",
+                   "{}; {}; {}; {}; {}; {}; {}; {}; {}; {}; {}; {}",
                    current_profile[0],
                    current_profile[1],
                    current_profile[2],
@@ -660,15 +663,17 @@ impl Proxy for TcpProxy {
                    current_profile[7],
                    current_profile[8],
                    current_profile[9],
-                   current_profile[10]
+                   current_profile[10],
+                   current_profile[11]
                );
            }
 
            self.current_index = 0;
+           self.current_polling_count = 0;
         }
 
         println!("Print profile catloop");
-        self.catloop.print_profile();
+        // self.catloop.print_profile();
         println!("Print profile in libos");
         self.in_libos.print_profile();
         println!("Done printing profile");
@@ -683,14 +688,14 @@ impl Proxy for TcpProxy {
         self.something_happened = false;
         timer!("proxy::non_blocking_poll");
         { // Borrow scope
-            let current_profile: &mut [u64; 11] = &mut self.poll_vec_profile[self.current_index];
+            let current_profile: &mut [u64; 12] = &mut self.poll_vec_profile[self.current_index];
             current_profile[0] = constants::get_current_rdtscp();
         }
         // Poll incoming flows.
         if let Some(qr) = self.in_libos.poll_incoming(timeout_incoming) {
             self.something_happened = true;
             { // Borrow scope
-                let current_profile: &mut [u64; 11] = &mut self.poll_vec_profile[self.current_index];
+                let current_profile: &mut [u64; 12] = &mut self.poll_vec_profile[self.current_index];
                 current_profile[1] = constants::get_current_rdtscp();
             }
             timer!("proxy::non_blocking_poll::incoming");
@@ -719,14 +724,14 @@ impl Proxy for TcpProxy {
         }
 
         { // Borrow scope
-            let current_profile: &mut [u64; 11] = &mut self.poll_vec_profile[self.current_index];
+            let current_profile: &mut [u64; 12] = &mut self.poll_vec_profile[self.current_index];
             current_profile[5] = constants::get_current_rdtscp();
         }
 
         // Poll outgoing flows.
         if let Some(qr) = self.poll_outgoing(timeout_outgoing) {
             { // Borrow scope
-                let current_profile: &mut [u64; 11] = &mut self.poll_vec_profile[self.current_index];
+                let current_profile: &mut [u64; 12] = &mut self.poll_vec_profile[self.current_index];
                 self.something_happened = true;
                 current_profile[6] = constants::get_current_rdtscp();
             }
@@ -751,15 +756,19 @@ impl Proxy for TcpProxy {
         }
 
         { // Borrow scope
-            let current_profile: &mut [u64; 11] = &mut self.poll_vec_profile[self.current_index];
+            let current_profile: &mut [u64; 12] = &mut self.poll_vec_profile[self.current_index];
             current_profile[10] = constants::get_current_rdtscp();
 
             if self.something_happened || current_profile[10] - current_profile[0] > 100000 {
+                current_profile[11] =self.current_polling_count;
+                self.current_polling_count = 0;
                 self.current_index += 1;
 
                 if self.current_index == 20000 {
                     self.print_profile(false);
                 }
+            } else {
+              self.current_polling_count += 1;
             }
         }
 

@@ -43,7 +43,7 @@ impl IncomingUdpLibos {
     const INCOMING_LENGTH: usize = 1024;
 
     pub fn print_profile(&mut self) {
-        self.in_libos.print_profile();
+        //self.in_libos.print_profile();
     }
 
     pub fn new(libos_name: String, local_addr: SocketAddr) -> Result<Self> {
