@@ -723,8 +723,8 @@ impl UdpProxy {
             "
 catmem:
     name_prefix: {}
-catnip:
-    my_ipv4_addr: {}
+demikernel:
+    local_ipv4_addr: {}
 ",
             vm_id,
             remote_addr.ip().to_string()
