@@ -265,8 +265,8 @@ impl TcpProxy {
             "
 catmem:
     name_prefix: {}
-catnip:
-    my_ipv4_addr: {}
+demikernel:
+    local_ipv4_addr: {}
 ",
             vm_id,
             remote_addr.ip().to_string()
@@ -663,8 +663,15 @@ impl Proxy for TcpProxy {
                    current_profile[10]
                );
            }
+
+           self.current_index = 0;
         }
 
+        println!("Print profile catloop");
+        self.catloop.print_profile();
+        println!("Print profile in libos");
+        self.in_libos.print_profile();
+        println!("Done printing profile");
         Ok(())
     }
 
@@ -749,6 +756,10 @@ impl Proxy for TcpProxy {
 
             if self.something_happened || current_profile[10] - current_profile[0] > 100000 {
                 self.current_index += 1;
+
+                if self.current_index == 20000 {
+                    self.print_profile(false);
+                }
             }
         }
 

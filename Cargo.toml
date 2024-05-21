@@ -14,7 +14,7 @@ members = [
 #=======================================================================================================================
 [workspace.dependencies]
 # Demikernel Organization
-demikernel = { git = "https://github.com/esaurez/demikernel", branch = "feature-pal-nimble_shared_memory"}
+demikernel = { git = "https://github.com/esaurez/demikernel", branch = "feature-pal-nimble_shared_memory_profile_waitany"}
 
 # Third Party
 anyhow = "1.0.75"

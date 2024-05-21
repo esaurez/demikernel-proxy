@@ -69,6 +69,10 @@ impl IncomingTcpLibos {
         })
     }
 
+    pub fn print_profile(&mut self) {
+        self.in_libos.print_profile();
+    }
+
     /// Issues a `push()` operation in an incoming flow.
     /// This function fails if the underlying `push()` operation fails.
     pub fn issue_incoming_push(&mut self, qd: QDesc, sga: &demi_sgarray_t) -> Result<()> {

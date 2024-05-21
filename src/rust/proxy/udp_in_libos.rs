@@ -42,6 +42,10 @@ impl IncomingUdpLibos {
     /// Change this value accordingly so as to avoid allocations on the datapath.
     const INCOMING_LENGTH: usize = 1024;
 
+    pub fn print_profile(&mut self) {
+        self.in_libos.print_profile();
+    }
+
     pub fn new(libos_name: String, local_addr: SocketAddr) -> Result<Self> {
         timer!("proxy::udp::new");
         // Instantiate LibOS for handling incoming flows.
