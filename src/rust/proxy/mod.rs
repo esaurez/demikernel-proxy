@@ -604,6 +604,7 @@ impl Proxy for TcpProxy {
                 demi_opcode_t::DEMI_OPC_FAILED => {
                     // Check if this is an unrecoverable error.
                     if qr.qr_ret != libc::ECONNRESET as i64 {
+                        println!("ERROR: operation failed (error={:?})", qr.qr_ret);
                         anyhow::bail!("operation failed")
                     }
                     println!("WARN: client reset connection");
@@ -631,6 +632,7 @@ impl Proxy for TcpProxy {
                 demi_opcode_t::DEMI_OPC_FAILED => {
                     // Check if this is an unrecoverable error.
                     if qr.qr_ret != libc::ECONNRESET as i64 {
+                        println!("ERROR: operation failed (error={:?})", qr.qr_ret);
                         anyhow::bail!("operation failed")
                     }
                     println!("WARN: server reset connection");
