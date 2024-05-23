@@ -707,6 +707,7 @@ impl Proxy for TcpProxy {
                 demi_opcode_t::DEMI_OPC_FAILED => {
                     // Check if this is an unrecoverable error.
                     if qr.qr_ret != libc::ECONNRESET as i64 {
+                        println!("ERROR: operation failed (error={:?})", qr.qr_ret);
                         anyhow::bail!("operation failed")
                     }
                     println!("WARN: client reset connection");
@@ -744,6 +745,7 @@ impl Proxy for TcpProxy {
                 demi_opcode_t::DEMI_OPC_FAILED => {
                     // Check if this is an unrecoverable error.
                     if qr.qr_ret != libc::ECONNRESET as i64 {
+                        println!("ERROR: operation failed (error={:?})", qr.qr_ret);
                         anyhow::bail!("operation failed")
                     }
                     println!("WARN: server reset connection");
@@ -853,8 +855,8 @@ impl UdpProxy {
             "
 catmem:
     name_prefix: {}
-catnip:
-    my_ipv4_addr: {}
+demikernel:
+    local_ipv4_addr: {}
 ",
             vm_id,
             remote_addr.ip().to_string()
@@ -1294,8 +1296,8 @@ impl UdpTcpProxy {
             "
 catmem:
     name_prefix: {}
-catnip:
-    my_ipv4_addr: {}
+demikernel:
+    local_ipv4_addr: {}
 ",
             vm_id,
             remote_addr.ip().to_string()
