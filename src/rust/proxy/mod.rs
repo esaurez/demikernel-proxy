@@ -1339,6 +1339,7 @@ demikernel:
         let catloop_qd: QDesc = match catloop_qd_opt {
             Some(catloop_qd) => *catloop_qd,
             None => {
+                println!("INFO: creating outgoing socket (ip_addr={:?})", ip_addr);
                 // Create outgoing socket.
                 self.create_outgoing_socket(&ip_addr)?
             },
@@ -1347,7 +1348,19 @@ demikernel:
         // Push SGA to concerned outgoing flow.
         let src: *mut libc::c_uchar = incoming_sga.sga_segs[0].sgaseg_buf as *mut libc::c_uchar;
         let len: usize = incoming_sga.sga_segs[0].sgaseg_len as usize;
-        if let Ok(outgoing_sga) = self.catloop.sgaalloc(len) {
+        if len == 1 {
+            // Close the TCP side connection
+            println!("Closing connection to VM");
+            if let Err(e) = self.catloop.close(catloop_qd) {
+                println!("ERROR: close failed (error={:?})", e);
+                println!("WARN: leaking socket descriptor (sockqd={:?})", catloop_qd);
+            }
+
+            self.in_libos.remove_incoming_map(&ip_addr);
+            // Clean outgoing maps
+            self.outgoing_qds.remove(&catloop_qd);
+            self.outgoing_qds_map.remove(&catloop_qd);
+        } else if let Ok(outgoing_sga) = self.catloop.sgaalloc(len) {
             // Copy.
             let dest: *mut libc::c_uchar = outgoing_sga.sga_segs[0].sgaseg_buf as *mut libc::c_uchar;
             Self::copy(src, dest, len);
@@ -1460,8 +1473,12 @@ demikernel:
         // Extract queue descriptor of outgoing connection.
         let outgoing_qd: QDesc = qr.qr_qd.into();
 
-        // It is safe to call except() here, because `outgoing_qd` is ensured to be in the table of queue descriptors.
-        // All queue descriptors are registered when connection is established.
+        // The queue may not longer exist in outgoing_qds if the server has closed the connection.
+        if !self.outgoing_qds.contains_key(&outgoing_qd) {
+            println!("WARN: Message received from VM after connection closed");
+            return Ok(());
+        }
+
         let has_inflight_pop: bool = self
             .outgoing_qds
             .get_mut(&outgoing_qd)
@@ -1564,10 +1581,15 @@ impl Proxy for UdpTcpProxy {
                 demi_opcode_t::DEMI_OPC_FAILED => {
                     println!("ERROR: outgoing operation failed (error={:?})", qr.qr_ret);
                     let catloop_qd: QDesc = qr.qr_qd.into();
-                    if let Err(e) = self.issue_outgoing_pop(catloop_qd) {
-                        println!("ERROR: failed to issue outgoing pop (error={:?})", e);
+                    // check if catloop_qd is in the outgoing_qds_map
+                    if self.outgoing_qds_map.contains_key(&catloop_qd) {
+                        if let Err(e) = self.issue_outgoing_pop(catloop_qd) {
+                            println!("ERROR: failed to issue outgoing pop (error={:?})", e);
+                        }
+                        anyhow::bail!("operation failed")
+                    } else {
+                        println!("WARN: Failure in message received from VM after connection closed")
                     }
-                    anyhow::bail!("operation failed")
                 },
                 demi_opcode_t::DEMI_OPC_ACCEPT => self.handle_unexpected("outgoing_accept", &qr)?,
                 demi_opcode_t::DEMI_OPC_INVALID => self.handle_unexpected("outgoing_invalid", &qr)?,

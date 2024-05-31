@@ -99,6 +99,10 @@ impl IncomingUdpLibos {
         self.incoming_client_map.get(ip_address)
     }
 
+    pub fn remove_incoming_map(&mut self, ip_address: &SocketAddr) -> Option<QDesc> {
+        self.incoming_client_map.remove(ip_address)
+    }
+
     /// Setups local socket.
     fn setup_local_socket(in_libos: &mut LibOS, local_addr: SocketAddr) -> Result<QDesc> {
         timer!("proxy::udp::setup_local_socket");
